@@ -127,21 +127,15 @@ class MainActivity : AppCompatActivity() {
                         return@forEachIndexed
                     }
                     videoTmp = File(cacheDir, "v_$index.mp4")
-                    val dur = engine.trimVideoToMp4(uri, 3_000_000L, videoTmp)
-                    if (dur != null && videoTmp.exists() && videoTmp.length() > 0L) {
-                        presentationTs = dur
-                    } else {
+                    log("  正在解码并重编码视频（保持原色彩与方向）...")
+                    val dur = engine.reencodeVideoToMp4(uri, 3_000_000L, videoTmp)
+                    if (dur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
                         videoTmp.delete()
-                        log("  非 H.264 视频，尝试自动转码为 H.264...")
-                        val transDur = engine.transcodeVideoToMp4(uri, 3_000_000L, videoTmp)
-                        if (transDur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
-                            val detected = engine.detectVideoMime(uri) ?: "未知"
-                            log("  ✗ 视频处理失败（检测到 $detected）。手机录的视频若开了 HEVC/H.265，请在相机设置里关闭\"高效视频编码\"后重录。")
-                            videoTmp.delete()
-                            return@forEachIndexed
-                        }
-                        presentationTs = transDur
+                        val detected = engine.detectVideoMime(uri) ?: "未知"
+                        log("  ✗ 视频处理失败（检测到 $detected）。该视频可能编码特殊或损坏，请换一个视频重试。")
+                        return@forEachIndexed
                     }
+                    presentationTs = dur
                 } else if (mime.startsWith("image/")) {
                     val bmp = engine.decodeImage(uri, 1280)
                     if (bmp == null) {
