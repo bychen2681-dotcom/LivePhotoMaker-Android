@@ -19,16 +19,32 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="6dp"
-        android:text="把图片 / 视频转成 Live 图，自动保存到 手机存储/Download/Live图"
+        android:text="把图片 / 视频转成 Live 图，先选择保存目录，再选文件"
         android:textSize="14sp"
         android:textColor="#666666" />
+
+    <Button
+        android:id="@+id/selectDirBtn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:text="① 选择保存目录" />
+
+    <TextView
+        android:id="@+id/dirText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="保存到：未选择"
+        android:textSize="14sp"
+        android:textColor="#333333" />
 
     <Button
         android:id="@+id/selectBtn"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="20dp"
-        android:text="① 选择图片 / 视频（可多选）" />
+        android:layout_marginTop="12dp"
+        android:text="② 选择图片 / 视频（可多选）" />
 
     <TextView
         android:id="@+id/selectedText"
@@ -43,7 +59,7 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
-        android:text="② 开始转换" />
+        android:text="③ 开始转换" />
 
     <ProgressBar
         android:id="@+id/progressBar"

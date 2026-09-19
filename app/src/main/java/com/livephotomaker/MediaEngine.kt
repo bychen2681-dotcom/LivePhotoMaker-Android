@@ -270,4 +270,148 @@ class MediaEngine(private val context: Context) {
         }
         return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
     }
+
+    /** 检测视频文件的视频轨道 MIME 类型（如 video/hevc、video/avc） */
+    fun detectVideoMime(uri: Uri): String? {
+        val cr = context.contentResolver
+        val pfd = cr.openFileDescriptor(uri, "r") ?: return null
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(pfd.fileDescriptor)
+            for (i in 0 until extractor.trackCount) {
+                val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME)
+                if (mime != null && mime.startsWith("video/")) return mime
+            }
+        } catch (_: Exception) {
+        } finally {
+            extractor.release()
+            pfd.close()
+        }
+        return null
+    }
+
+    /**
+     * 通用视频转码 fallback：把任意 Android 可解码的视频（含 HEVC/H.265）转成 H.264 MP4。
+     * 采用 MediaMetadataRetriever 逐帧取图再编码，速度较慢但兼容性好，仅用于前 3 秒。
+     */
+    fun transcodeVideoToMp4(uri: Uri, maxDurationUs: Long, outFile: File): Long? {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(context, uri)
+            val rawW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1280
+            val rawH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 720
+            val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toInt() ?: 0
+            val durMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
+            val targetUs = kotlin.math.min(durMs * 1000L, maxDurationUs)
+            if (targetUs <= 0) return null
+
+            val srcW = if (rotation % 180 == 0) rawW else rawH
+            val srcH = if (rotation % 180 == 0) rawH else rawW
+
+            val maxDim = 1280
+            var outW = srcW
+            var outH = srcH
+            if (kotlin.math.max(srcW, srcH) > maxDim) {
+                val scale = maxDim.toFloat() / kotlin.math.max(srcW, srcH)
+                outW = (srcW * scale).toInt() / 2 * 2
+                outH = (srcH * scale).toInt() / 2 * 2
+            }
+
+            val fps = 15
+            val totalSeconds = targetUs / 1_000_000L
+            val totalFrames = kotlin.math.max(1, (totalSeconds * fps).toInt())
+            val frameDurUs = 1_000_000L / fps
+            val bitrate = (outW * outH * fps * 0.2).toInt().coerceIn(1_000_000, 8_000_000)
+
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, pickColorFormat())
+            }
+
+            val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            encoder.start()
+
+            val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            var muxerStarted = false
+            var trackIndex = -1
+            val bufferInfo = MediaCodec.BufferInfo()
+
+            var frameIndex = 0
+            var inputDone = false
+            var outputDone = false
+            var pts = 0L
+
+            while (!outputDone) {
+                if (!inputDone) {
+                    val inIdx = encoder.dequeueInputBuffer(10_000)
+                    if (inIdx >= 0) {
+                        if (frameIndex < totalFrames) {
+                            val timeUs = frameIndex * frameDurUs
+                            val rawBmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                            if (rawBmp == null) {
+                                encoder.queueInputBuffer(inIdx, 0, 0, 0, 0)
+                            } else {
+                                val frame = preprocessFrame(rawBmp, rotation, outW, outH)
+                                rawBmp.recycle()
+                                val nv21 = bitmapToNV21(frame)
+                                frame.recycle()
+                                val inBuf = encoder.getInputBuffer(inIdx)!!
+                                inBuf.clear()
+                                inBuf.put(nv21)
+                                encoder.queueInputBuffer(inIdx, 0, nv21.size, pts, 0)
+                            }
+                            pts += frameDurUs
+                            frameIndex++
+                        } else {
+                            encoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        }
+                    }
+                }
+
+                val outIdx = encoder.dequeueOutputBuffer(bufferInfo, 10_000)
+                when {
+                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> { /* 继续轮询 */ }
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        trackIndex = muxer.addTrack(encoder.outputFormat)
+                        muxer.start()
+                        muxerStarted = true
+                    }
+                    outIdx >= 0 -> {
+                        val outBuf = encoder.getOutputBuffer(outIdx)!!
+                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && muxerStarted) {
+                            muxer.writeSampleData(trackIndex, outBuf, bufferInfo)
+                        }
+                        encoder.releaseOutputBuffer(outIdx, false)
+                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
+                    }
+                }
+            }
+
+            muxer.stop()
+            muxer.release()
+            encoder.stop()
+            encoder.release()
+            return targetUs
+        } catch (e: Exception) {
+            return null
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** 按目标尺寸和旋转角度预处理一帧 */
+    private fun preprocessFrame(bmp: Bitmap, rotation: Int, outW: Int, outH: Int): Bitmap {
+        val matrix = Matrix()
+        if (rotation != 0) matrix.postRotate(rotation.toFloat())
+        if (bmp.width != outW || bmp.height != outH) {
+            val scaleX = outW.toFloat() / bmp.width
+            val scaleY = outH.toFloat() / bmp.height
+            matrix.postScale(scaleX, scaleY)
+        }
+        return Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+    }
 }

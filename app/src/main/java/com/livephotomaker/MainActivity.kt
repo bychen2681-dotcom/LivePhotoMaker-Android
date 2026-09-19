@@ -1,14 +1,15 @@
 package com.livephotomaker
 
-import android.content.ContentValues
+import android.content.ContentResolver
 import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
-import android.provider.MediaStore
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.documentfile.provider.DocumentFile
 import com.livephotomaker.databinding.ActivityMainBinding
 import java.io.File
 
@@ -16,15 +17,24 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private val selectedUris = ArrayList<Uri>()
+    private var selectedDirUri: Uri? = null
+    private var selectedDirName: String = "未选择"
     private val REQ_PICK = 1001
+    private val REQ_PICK_DIR = 1002
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        binding.selectDirBtn.setOnClickListener { openDirPicker() }
         binding.selectBtn.setOnClickListener { openPicker() }
         binding.convertBtn.setOnClickListener { startConvert() }
+    }
+
+    private fun openDirPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        startActivityForResult(intent, REQ_PICK_DIR)
     }
 
     private fun openPicker() {
@@ -40,7 +50,24 @@ class MainActivity : AppCompatActivity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_PICK && resultCode == RESULT_OK && data != null) {
+        if (resultCode != RESULT_OK || data == null) return
+
+        if (requestCode == REQ_PICK_DIR) {
+            data.data?.let { uri ->
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                } catch (_: Exception) { /* 部分提供方可能不支持，继续用一次性权限 */ }
+                selectedDirUri = uri
+                selectedDirName = getDirDisplayName(uri) ?: uri.toString()
+                binding.dirText.text = "保存到：$selectedDirName"
+            }
+            return
+        }
+
+        if (requestCode == REQ_PICK) {
             selectedUris.clear()
             val clip = data.clipData
             if (clip != null) {
@@ -48,7 +75,6 @@ class MainActivity : AppCompatActivity() {
             } else {
                 data.data?.let { selectedUris.add(it) }
             }
-            // 持久化读取权限，方便以后再次访问
             selectedUris.forEach { uri ->
                 try {
                     contentResolver.takePersistableUriPermission(
@@ -61,6 +87,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startConvert() {
+        if (selectedDirUri == null) {
+            toast("请先选择保存目录")
+            return
+        }
         if (selectedUris.isEmpty()) {
             toast("请先选择图片或视频")
             return
@@ -74,7 +104,11 @@ class MainActivity : AppCompatActivity() {
     private fun runConvert() {
         val engine = MediaEngine(this)
         val resolver = contentResolver
-        val downloadsUri = MediaStore.Downloads.getContentUri("external")
+        val parentDir = DocumentFile.fromTreeUri(this, selectedDirUri!!)
+            ?: run {
+                log("✗ 无法访问选中的保存目录")
+                return
+            }
 
         selectedUris.forEachIndexed { index, uri ->
             val mime = resolver.getType(uri) ?: ""
@@ -94,12 +128,20 @@ class MainActivity : AppCompatActivity() {
                     }
                     videoTmp = File(cacheDir, "v_$index.mp4")
                     val dur = engine.trimVideoToMp4(uri, 3_000_000L, videoTmp)
-                    if (dur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
-                        log("  ✗ 视频格式不支持（需 H.264 MP4），跳过")
-                        videoTmp?.delete()
-                        return@forEachIndexed
+                    if (dur != null && videoTmp.exists() && videoTmp.length() > 0L) {
+                        presentationTs = dur
+                    } else {
+                        videoTmp.delete()
+                        log("  非 H.264 视频，尝试自动转码为 H.264...")
+                        val transDur = engine.transcodeVideoToMp4(uri, 3_000_000L, videoTmp)
+                        if (transDur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
+                            val detected = engine.detectVideoMime(uri) ?: "未知"
+                            log("  ✗ 视频处理失败（检测到 $detected）。手机录的视频若开了 HEVC/H.265，请在相机设置里关闭\"高效视频编码\"后重录。")
+                            videoTmp.delete()
+                            return@forEachIndexed
+                        }
+                        presentationTs = transDur
                     }
-                    presentationTs = dur
                 } else if (mime.startsWith("image/")) {
                     val bmp = engine.decodeImage(uri, 1280)
                     if (bmp == null) {
@@ -120,21 +162,19 @@ class MainActivity : AppCompatActivity() {
                     return@forEachIndexed
                 }
 
-                // 写入 MediaStore：Download/Live图/xxx.jpg
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, "$baseName.jpg")
-                    put(MediaStore.Downloads.MIME_TYPE, "image/jpeg")
-                    put(MediaStore.Downloads.RELATIVE_PATH, "Live图")
-                }
-                val outUri = resolver.insert(downloadsUri, values)
-                if (outUri == null) {
-                    log("  ✗ 无法创建输出文件（存储权限不足）")
-                    return@forEachIndexed
-                }
-                resolver.openOutputStream(outUri)?.use { os ->
+                // 在选中的目录下创建/查找 Live图 子目录
+                val liveDir = parentDir.findFile("Live图")
+                    ?: parentDir.createDirectory("Live图")
+                    ?: parentDir
+                val outDoc = liveDir.createFile("image/jpeg", "$baseName.jpg")
+                    ?: run {
+                        log("  ✗ 无法创建输出文件（目录无写入权限）")
+                        return@forEachIndexed
+                    }
+                resolver.openOutputStream(outDoc.uri)?.use { os ->
                     MotionPhotoWriter.wrap(cover!!, videoTmp!!, presentationTs, os)
                 }
-                log("  ✓ 完成，已保存到 Download/Live图/${baseName}.jpg")
+                log("  ✓ 完成，已保存到 ${selectedDirName}/Live图/${baseName}.jpg")
                 videoTmp?.delete()
             } catch (e: Exception) {
                 log("  ✗ 出错：${e.message}")
@@ -142,7 +182,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { binding.progressBar.progress = index + 1 }
         }
 
-        log("全部处理完成！文件在：手机存储/Download/Live图")
+        log("全部处理完成！文件在：${selectedDirName}/Live图")
         runOnUiThread {
             binding.convertBtn.isEnabled = true
             toast("转换完成")
@@ -164,6 +204,14 @@ class MainActivity : AppCompatActivity() {
             cursor?.close()
         }
         return name
+    }
+
+    private fun getDirDisplayName(uri: Uri): String? {
+        return try {
+            DocumentFile.fromTreeUri(this, uri)?.name ?: uri.lastPathSegment
+        } catch (_: Exception) {
+            uri.lastPathSegment
+        }
     }
 
     private fun log(msg: String) = runOnUiThread {
