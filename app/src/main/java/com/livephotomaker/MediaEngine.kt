@@ -119,7 +119,7 @@ class MediaEngine(private val context: Context) {
                 if (t - minStart > maxDurationUs) break
                 val flags = extractor.sampleFlags
                 buffer.position(0); buffer.limit(size)
-                info.set(t - minStart, size, 0, flags)
+                info.set(0, size, t - minStart, flags)
                 muxer.writeSampleData(trackMap[i], buffer, info)
                 if (t - minStart > actualDur) actualDur = t - minStart
                 extractor.advance()
