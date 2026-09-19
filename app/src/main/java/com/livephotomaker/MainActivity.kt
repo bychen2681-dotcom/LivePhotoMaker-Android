@@ -127,8 +127,8 @@ class MainActivity : AppCompatActivity() {
                         return@forEachIndexed
                     }
                     videoTmp = File(cacheDir, "v_$index.mp4")
-                    log("  正在解码并重编码视频（保持原色彩与方向）...")
-                    val dur = engine.reencodeVideoToMp4(uri, 3_000_000L, videoTmp)
+                    log("  正在截取视频前 3 秒并封装为 MP4（不解码、保持原编码）...")
+                    val dur = engine.transmuxVideoToMp4(uri, 3_000_000L, videoTmp)
                     if (dur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
                         videoTmp.delete()
                         val detected = engine.detectVideoMime(uri) ?: "未知"

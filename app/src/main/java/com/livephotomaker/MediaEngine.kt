@@ -6,7 +6,6 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -15,6 +14,7 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
@@ -22,10 +22,11 @@ import kotlin.math.max
 
 /**
  * 媒体处理引擎：对标原 Python 脚本（video_转Live图.py）
- *  - 视频：取首帧做封面；整段视频解码后逐帧重编码为 H.264 MP4（与原脚本"逐帧重编码"一致，不乱码）
+ *  - 视频：取首帧做封面；用 MediaExtractor + MediaMuxer 流拷贝为 MP4（与 Python 中
+ *    ffmpeg -t 3 -c copy 一致），只保留前 3 秒，并从第一个关键帧开始，避免花屏。
  *  - 图片：生成 2 秒缓慢放大的视频（smoothstep 缓动），封装为 H.264 MP4
  *
- * 色彩关键修正：
+ * 色彩关键修正（图片生成视频）：
  *  - 输入给 H.264 编码器的 YUV 必须是 NV12（U 在前、V 在后）。Android 的
  *    COLOR_FormatYUV420Flexible/SemiPlanar 编码器期望的就是 NV12，之前误用 NV21(V,U)
  *    会导致色度整体翻转、颜色发飘。
@@ -218,7 +219,6 @@ class MediaEngine(private val context: Context) {
         for (cf in caps.colorFormats) {
             if (cf == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) return cf
         }
-        // 极少数设备只有 Planar，需要 YV12 布局（本类未实现，优先前面两种）
         return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
     }
 
@@ -251,18 +251,37 @@ class MediaEngine(private val context: Context) {
     }
 
     /**
-     * 把任意 Android 可解码的视频（H.264 或 HEVC/H.265）整段解码、逐帧重编码为 H.264 MP4。
-     * 与原 Python 脚本"逐帧重新编码"思路一致：保证开头是关键帧、无 B 帧错乱，播放不乱码。
-     * 最多保留前 maxDurationUs 微秒。返回实际时长（微秒）；失败返回 null。
+     * 把任意 Android 可解封装的视频（H.264 / HEVC / 其他）流拷贝为 H.264/HEVC MP4。
+     * 与原 Python 脚本 `ffmpeg -t 3 -c copy` 一致：不解码、不重编码，只截取前 3 秒。
+     * 从第一个关键帧（I 帧）开始写，避免开头花屏。
+     * 返回实际视频时长（微秒）；失败返回 null。
      */
-    fun reencodeVideoToMp4(uri: Uri, maxDurationUs: Long, outFile: File): Long? {
+    fun transmuxVideoToMp4(uri: Uri, maxDurationUs: Long, outFile: File): Long? {
         val cr = context.contentResolver
         val pfd = cr.openFileDescriptor(uri, "r") ?: return null
+        val result = doTransmux(pfd, maxDurationUs, outFile, startFromKeyframe = true)
+        if (result != null) return result
+        pfd.close()
+
+        val pfd2 = cr.openFileDescriptor(uri, "r") ?: return null
+        return try {
+            doTransmux(pfd2, maxDurationUs, outFile, startFromKeyframe = false)
+        } finally {
+            pfd2.close()
+        }
+    }
+
+    private fun doTransmux(
+        pfd: ParcelFileDescriptor,
+        maxDurationUs: Long,
+        outFile: File,
+        startFromKeyframe: Boolean
+    ): Long? {
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(pfd.fileDescriptor)
         } catch (e: Exception) {
-            pfd.close()
+            extractor.release()
             return null
         }
 
@@ -278,225 +297,80 @@ class MediaEngine(private val context: Context) {
             }
         }
         if (videoTrack < 0 || videoFormat == null) {
-            extractor.release(); pfd.close(); return null
+            extractor.release()
+            return null
         }
 
-        val srcW = videoFormat.getInteger(MediaFormat.KEY_WIDTH)
-        val srcH = videoFormat.getInteger(MediaFormat.KEY_HEIGHT)
         val rotation = if (videoFormat.containsKey(MediaFormat.KEY_ROTATION))
             (videoFormat.getInteger(MediaFormat.KEY_ROTATION) + 360) % 360 else 0
-        val outW = if (rotation == 90 || rotation == 270) srcH else srcW
-        val outH = if (rotation == 90 || rotation == 270) srcW else srcH
-
-        val fps = if (videoFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
-            videoFormat.getInteger(MediaFormat.KEY_FRAME_RATE).coerceIn(1, 60)
-        } else 30
-        val bitrate = (outW * outH * fps * 0.25).toInt().coerceIn(1_000_000, 12_000_000)
-
-        val colorFormat = pickColorFormat()
-        val encFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
-            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            setColorStandard(this)
-        }
-
-        val decoder = MediaCodec.createDecoderByType(videoFormat.getString(MediaFormat.KEY_MIME)!!)
-        var decoderStarted = false
-        try {
-            decoder.configure(videoFormat, null, null, 0)
-            decoder.start()
-            decoderStarted = true
-        } catch (e: Exception) {
-            decoder.release(); extractor.release(); pfd.close(); return null
-        }
-
-        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        encoder.configure(encFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoder.start()
-
-        val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var muxerStarted = false
-        var trackIndex = -1
-        val eInfo = MediaCodec.BufferInfo()
-        val dInfo = MediaCodec.BufferInfo()
 
         extractor.selectTrack(videoTrack)
 
-        var decoderEos = false
-        var encoderEos = false
-        var extractorDone = false
-        var maxPtsFed = 0L
-        var guard = 0
-
-        while (!encoderEos && guard < 200000) {
-            guard++
-
-            // 1) 喂解码器：从 extractor 取样本
-            if (!decoderEos && !extractorDone) {
-                val inIdx = decoder.dequeueInputBuffer(10_000)
-                if (inIdx >= 0) {
-                    val buf = decoder.getInputBuffer(inIdx)!!
-                    buf.position(0)
-                    val size = extractor.readSampleData(buf, 0)
-                    if (size < 0) {
-                        decoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        decoderEos = true
-                    } else {
-                        val pts = extractor.sampleTime
-                        val flags = extractor.sampleFlags
-                        if (pts > maxDurationUs) {
-                            decoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            decoderEos = true
-                            extractorDone = true
-                        } else {
-                            decoder.queueInputBuffer(inIdx, 0, size, pts, flags)
-                            extractor.advance()
-                        }
-                    }
+        var firstPts: Long? = null
+        if (startFromKeyframe) {
+            while (true) {
+                val pts = extractor.sampleTime
+                if (pts < 0) break
+                if (extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
+                    firstPts = pts
+                    break
                 }
+                if (!extractor.advance()) break
             }
-
-            // 2) 排空解码器 -> 编码（带旋转与色彩转换）
-            val dOut = decoder.dequeueOutputBuffer(dInfo, 10_000)
-            when {
-                dOut == MediaCodec.INFO_TRY_AGAIN_LATER -> { /* 继续 */ }
-                dOut == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> { /* 忽略，用 getOutputImage 即可 */ }
-                dOut >= 0 -> {
-                    val img = decoder.getOutputImage(dOut)
-                    val pts = dInfo.presentationTimeUs
-                    if (img != null && pts <= maxDurationUs) {
-                        val nv12 = imageToNV12(img, rotation, outW, outH)
-                        val eIn = encoder.dequeueInputBuffer(10_000)
-                        if (eIn >= 0) {
-                            val eb = encoder.getInputBuffer(eIn)!!
-                            eb.clear(); eb.put(nv12)
-                            val feedPts = if (pts < 0) 0L else pts
-                            encoder.queueInputBuffer(eIn, 0, nv12.size, feedPts, 0)
-                            if (feedPts > maxPtsFed) maxPtsFed = feedPts
-                        }
-                    }
-                    decoder.releaseOutputBuffer(dOut, false)
-                    if (dInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                        val eIn = encoder.dequeueInputBuffer(10_000)
-                        if (eIn >= 0) encoder.queueInputBuffer(eIn, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                    }
-                }
+            if (firstPts == null) {
+                extractor.release()
+                return null
             }
-
-            // 3) 排空编码器 -> muxer
-            val eOut = encoder.dequeueOutputBuffer(eInfo, 10_000)
-            when {
-                eOut == MediaCodec.INFO_TRY_AGAIN_LATER -> { /* 继续 */ }
-                eOut == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    trackIndex = muxer.addTrack(encoder.outputFormat)
-                    muxer.start(); muxerStarted = true
-                }
-                eOut >= 0 -> {
-                    val ob = encoder.getOutputBuffer(eOut)!!
-                    if (eInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && muxerStarted) {
-                        muxer.writeSampleData(trackIndex, ob, eInfo)
-                    }
-                    encoder.releaseOutputBuffer(eOut, false)
-                    if (eInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) encoderEos = true
-                }
-            }
+        } else {
+            firstPts = if (extractor.sampleTime >= 0) extractor.sampleTime else 0L
         }
 
-        val ok = muxerStarted && outFile.exists() && outFile.length() > 0 &&
-                (maxPtsFed > 0 || maxPtsFed == 0L)
-        muxer.stop(); muxer.release()
-        encoder.stop(); encoder.release()
-        decoder.stop(); decoder.release()
-        extractor.release(); pfd.close()
+        val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        muxer.setOrientationHint(rotation)
+        val trackIndex = muxer.addTrack(videoFormat)
+        muxer.start()
 
-        return if (outFile.exists() && outFile.length() > 0) maxPtsFed else null
-    }
+        var buffer = ByteBuffer.allocate(8 * 1024 * 1024) // 8 MB，足够手机视频单帧
+        var samplesWritten = 0
+        var lastPts = 0L
 
-    /**
-     * Image(YUV_420_888) -> NV12(含旋转) 字节数组。
-     * 先把 Image 拆成 Y/U/V 三个平面，再按 rotation 旋转后交错成 NV12（U 在前 V 在后）。
-     */
-    private fun imageToNV12(image: Image, rotation: Int, outW: Int, outH: Int): ByteArray {
-        val w = image.width
-        val h = image.height
-        val (yIn, uIn, vIn) = imageToPlanar(image, w, h)
+        while (true) {
+            val pts = extractor.sampleTime
+            if (pts < 0) break
+            if (pts - firstPts > maxDurationUs) break
 
-        val yOut = ByteArray(outW * outH)
-        val cw = outW / 2
-        val ch = outH / 2
-        val uOut = ByteArray(cw * ch)
-        val vOut = ByteArray(cw * ch)
-
-        val rot = (rotation % 360 + 360) % 360
-        for (oy in 0 until outH) {
-            for (ox in 0 until outW) {
-                val (sx, sy) = when (rot) {
-                    90 -> Pair(oy, h - 1 - ox)
-                    180 -> Pair(w - 1 - ox, h - 1 - oy)
-                    270 -> Pair(w - 1 - oy, ox)
-                    else -> Pair(ox, oy)
-                }
-                yOut[oy * outW + ox] = yIn[sy * w + sx]
-                if (oy % 2 == 0 && ox % 2 == 0) {
-                    val su = sx / 2
-                    val sv = sy / 2
-                    val cu = oy / 2
-                    val cv = ox / 2
-                    uOut[cu * cw + cv] = uIn[sv * (w / 2) + su]
-                    vOut[cu * cw + cv] = vIn[sv * (w / 2) + su]
-                }
+            // 保证 buffer 足够（API 28+ 可直接取 sampleSize）
+            val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                extractor.sampleSize.toInt()
+            } else 0
+            if (needed > buffer.capacity()) {
+                buffer = ByteBuffer.allocate(needed)
             }
+
+            buffer.clear()
+            val size = extractor.readSampleData(buffer, 0)
+            if (size < 0) break
+
+            buffer.position(0)
+            buffer.limit(size)
+
+            val flags = extractor.sampleFlags
+            val outPts = pts - firstPts
+            val info = MediaCodec.BufferInfo().apply {
+                set(0, size, outPts, flags)
+            }
+            muxer.writeSampleData(trackIndex, buffer, info)
+
+            lastPts = outPts
+            samplesWritten++
+
+            if (!extractor.advance()) break
         }
 
-        val nv12 = ByteArray(outW * outH + cw * ch * 2)
-        System.arraycopy(yOut, 0, nv12, 0, yOut.size)
-        var p = yOut.size
-        for (i in 0 until cw * ch) {
-            nv12[p++] = uOut[i]
-            nv12[p++] = vOut[i]
-        }
-        return nv12
-    }
+        muxer.stop()
+        muxer.release()
+        extractor.release()
 
-    /** 把 YUV_420_888 的 Image 拆成三个平面（Y / U / V）的紧凑数组 */
-    private fun imageToPlanar(image: Image, w: Int, h: Int): Triple<ByteArray, ByteArray, ByteArray> {
-        val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
-        val yb = yPlane.buffer
-        val ub = uPlane.buffer
-        val vb = vPlane.buffer
-        val ys = yPlane.rowStride
-        val yp = yPlane.pixelStride
-        val us = uPlane.rowStride
-        val up = uPlane.pixelStride
-        val vs = vPlane.rowStride
-        val vp = vPlane.pixelStride
-
-        val yOut = ByteArray(w * h)
-        val uOut = ByteArray(w * h / 4)
-        val vOut = ByteArray(w * h / 4)
-
-        var yi = 0
-        var ui = 0
-        var vi = 0
-        for (j in 0 until h) {
-            val yRow = j * ys
-            for (i in 0 until w) {
-                yOut[yi++] = yb.get(yRow + i * yp)
-            }
-            if (j % 2 == 0) {
-                val uRow = (j / 2) * us
-                val vRow = (j / 2) * vs
-                for (i in 0 until w step 2) {
-                    uOut[ui++] = ub.get(uRow + i * up)
-                    vOut[vi++] = vb.get(vRow + i * vp)
-                }
-            }
-        }
-        return Triple(yOut, uOut, vOut)
+        return if (samplesWritten > 0) lastPts else null
     }
 }
