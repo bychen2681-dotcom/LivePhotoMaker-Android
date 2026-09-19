@@ -458,7 +458,8 @@ class MediaEngine(private val context: Context) {
         var buffer = ByteBuffer.allocate(8 * 1024 * 1024)
         var samplesWritten = 0
         var lastPts = 0L
-        val endUs = startUs + durationUs
+        // durationUs <= 0 表示“截到视频末尾，不做长度限制”（用于整段直接转换）
+        val endUs = if (durationUs > 0) startUs + durationUs else Long.MAX_VALUE
 
         while (true) {
             val pts = extractor.sampleTime

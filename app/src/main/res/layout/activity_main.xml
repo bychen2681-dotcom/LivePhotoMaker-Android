@@ -39,12 +39,27 @@
         android:textSize="14sp"
         android:textColor="#333333" />
 
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="② 转换模式"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="#222222" />
+
+    <Spinner
+        android:id="@+id/modeSpinner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp" />
+
     <Button
         android:id="@+id/selectBtn"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
-        android:text="② 选择图片 / 视频（可多选）" />
+        android:text="选择图片 / 视频（可多选）" />
 
     <TextView
         android:id="@+id/selectedText"
@@ -55,38 +70,46 @@
         android:textSize="14sp" />
 
     <LinearLayout
+        android:id="@+id/segContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
-        android:orientation="horizontal">
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="分段时长（秒）："
+                android:textSize="14sp"
+                android:textColor="#333333"
+                android:layout_gravity="center_vertical" />
+
+            <EditText
+                android:id="@+id/segEdit"
+                android:layout_width="80dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:inputType="number"
+                android:digits="1234567890"
+                android:maxLength="2"
+                android:text="3"
+                android:textSize="14sp" />
+        </LinearLayout>
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="长视频分段时长（秒）："
-            android:textSize="14sp"
-            android:textColor="#333333"
-            android:layout_gravity="center_vertical" />
-
-        <EditText
-            android:id="@+id/segEdit"
-            android:layout_width="80dp"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:inputType="number"
-            android:digits="1234567890"
-            android:maxLength="2"
-            android:text="3"
-            android:textSize="14sp" />
+            android:layout_marginTop="2dp"
+            android:text="长视频会按此时长切成多段，每段生成一个 Live 图"
+            android:textSize="12sp"
+            android:textColor="#999999" />
     </LinearLayout>
-
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:text="（长视频会按此时长切成多段，每段生成一个 Live 图；图片与短视频忽略此设置）"
-        android:textSize="12sp"
-        android:textColor="#999999" />
 
     <Button
         android:id="@+id/convertBtn"

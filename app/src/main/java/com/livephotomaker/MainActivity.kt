@@ -7,6 +7,10 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.documentfile.provider.DocumentFile
@@ -19,6 +23,7 @@ class MainActivity : AppCompatActivity() {
     private val selectedUris = ArrayList<Uri>()
     private var selectedDirUri: Uri? = null
     private var selectedDirName: String = "未选择"
+    private var splitMode: Boolean = false
     private val REQ_PICK = 1001
     private val REQ_PICK_DIR = 1002
 
@@ -30,6 +35,18 @@ class MainActivity : AppCompatActivity() {
         binding.selectDirBtn.setOnClickListener { openDirPicker() }
         binding.selectBtn.setOnClickListener { openPicker() }
         binding.convertBtn.setOnClickListener { startConvert() }
+
+        val modes = arrayOf("图片或者视频转换", "长视频切割")
+        val spinnerAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, modes)
+        spinnerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        binding.modeSpinner.adapter = spinnerAdapter
+        binding.modeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
+                splitMode = position == 1
+                binding.segContainer.visibility = if (splitMode) View.VISIBLE else View.GONE
+            }
+            override fun onNothingSelected(parent: AdapterView<*>) {}
+        }
     }
 
     private fun openDirPicker() {
@@ -114,7 +131,8 @@ class MainActivity : AppCompatActivity() {
                 log("✗ 无法访问选中的保存目录")
                 return
             }
-        val segUs = readSegSeconds() * 1_000_000L
+        val split = splitMode
+        val segUs = if (split) readSegSeconds() * 1_000_000L else 0L
 
         selectedUris.forEachIndexed { index, uri ->
             val mime = contentResolver.getType(uri) ?: ""
@@ -123,7 +141,7 @@ class MainActivity : AppCompatActivity() {
             log("[${(index + 1)}/${selectedUris.size}] 处理：$displayName")
             try {
                 when {
-                    mime.startsWith("video/") -> handleVideo(engine, parentDir, uri, baseName, segUs)
+                    mime.startsWith("video/") -> handleVideo(engine, parentDir, uri, baseName, segUs, split)
                     mime.startsWith("image/") -> handleImage(engine, parentDir, uri, baseName)
                     else -> log("  ✗ 不支持的文件类型，跳过")
                 }
@@ -160,21 +178,46 @@ class MainActivity : AppCompatActivity() {
         videoTmp.delete()
     }
 
-    /** 视频：按设定时长切成多段，每段生成 1 个 Live 图 */
+    /** 视频：按模式处理。split=true 时按设定时长切成多段；否则整段直接转成 1 个 Live 图 */
     private fun handleVideo(
         engine: MediaEngine,
         parentDir: DocumentFile,
         uri: Uri,
         baseName: String,
-        segUs: Long
+        segUs: Long,
+        split: Boolean
     ) {
         val duration = engine.getVideoDurationUs(uri)
+        val durText = if (duration != null) String.format("%.2f", duration / 1_000_000.0) + " 秒" else "未知"
+        log("  视频时长：$durText")
+
+        if (!split) {
+            // 模式一：整段直接转成 1 个 Live 图（不分段）
+            val videoTmp = File(cacheDir, "v_${System.currentTimeMillis()}.mp4")
+            log("  整段转换为 1 个 Live 图（不解码、保持原编码）...")
+            val dur = engine.transmuxVideoSegment(uri, 0L, 0L, videoTmp)
+            if (dur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
+                log("  ✗ 视频转换失败，跳过")
+                videoTmp.delete()
+                return
+            }
+            val cover = engine.extractCoverFromVideo(uri) ?: engine.extractCoverFromVideo(uri, 0L)
+            if (cover == null) {
+                log("  ✗ 封面提取失败，跳过")
+                videoTmp.delete()
+                return
+            }
+            val saved = saveLivePhoto(engine, parentDir, cover, videoTmp, dur, baseName, "")
+            videoTmp.delete()
+            log(if (saved) "  ✓ 完成，已生成 1 个 Live 图" else "  ✗ 写入失败")
+            return
+        }
+
+        // 模式二：长视频切割，每段一个 Live 图
         val segCount = if (duration != null && duration > segUs) {
             ((duration + segUs - 1) / segUs).toInt()
         } else 1
-
-        val durText = if (duration != null) String.format("%.2f", duration / 1_000_000.0) + " 秒" else "未知"
-        log("  视频时长：$durText，将切成 $segCount 段（每段约 ${segUs / 1_000_000} 秒）")
+        log("  将切成 $segCount 段（每段约 ${segUs / 1_000_000} 秒）")
 
         var okCount = 0
         for (s in 0 until segCount) {
