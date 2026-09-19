@@ -44,6 +44,7 @@ class MainActivity : AppCompatActivity() {
             override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
                 splitMode = position == 1
                 binding.segContainer.visibility = if (splitMode) View.VISIBLE else View.GONE
+                binding.selectBtn.text = if (splitMode) "选择视频（可多选）" else "选择图片 / 视频（可多选）"
             }
             override fun onNothingSelected(parent: AdapterView<*>) {}
         }
