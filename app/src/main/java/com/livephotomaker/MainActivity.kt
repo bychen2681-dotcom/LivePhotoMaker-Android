@@ -101,75 +101,32 @@ class MainActivity : AppCompatActivity() {
         Thread { runConvert() }.start()
     }
 
+    private fun readSegSeconds(): Int {
+        val txt = binding.segEdit.text.toString().trim()
+        val v = txt.toIntOrNull()
+        return if (v != null && v in 1..30) v else 3
+    }
+
     private fun runConvert() {
         val engine = MediaEngine(this)
-        val resolver = contentResolver
         val parentDir = DocumentFile.fromTreeUri(this, selectedDirUri!!)
             ?: run {
                 log("✗ 无法访问选中的保存目录")
                 return
             }
+        val segUs = readSegSeconds() * 1_000_000L
 
         selectedUris.forEachIndexed { index, uri ->
-            val mime = resolver.getType(uri) ?: ""
+            val mime = contentResolver.getType(uri) ?: ""
             val displayName = getDisplayName(uri)
             val baseName = displayName.substringBeforeLast(".")
             log("[${(index + 1)}/${selectedUris.size}] 处理：$displayName")
             try {
-                var cover: ByteArray? = null
-                var videoTmp: File? = null
-                var presentationTs = 0L
-
-                if (mime.startsWith("video/")) {
-                    cover = engine.extractCoverFromVideo(uri)
-                    if (cover == null) {
-                        log("  ✗ 无法提取封面，跳过")
-                        return@forEachIndexed
-                    }
-                    videoTmp = File(cacheDir, "v_$index.mp4")
-                    log("  正在截取视频前 3 秒并封装为 MP4（不解码、保持原编码）...")
-                    val dur = engine.transmuxVideoToMp4(uri, 3_000_000L, videoTmp)
-                    if (dur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
-                        videoTmp.delete()
-                        val detected = engine.detectVideoMime(uri) ?: "未知"
-                        log("  ✗ 视频处理失败（检测到 $detected）。该视频可能编码特殊或损坏，请换一个视频重试。")
-                        return@forEachIndexed
-                    }
-                    presentationTs = dur
-                } else if (mime.startsWith("image/")) {
-                    val bmp = engine.decodeImage(uri, 1280)
-                    if (bmp == null) {
-                        log("  ✗ 无法解码图片，跳过")
-                        return@forEachIndexed
-                    }
-                    cover = engine.bitmapToJpeg(bmp, 92)
-                    videoTmp = File(cacheDir, "i_$index.mp4")
-                    engine.makeZoomVideo(bmp, videoTmp, 2.0f, 15, 0.035f)
-                    bmp.recycle()
-                    if (!videoTmp.exists() || videoTmp.length() == 0L) {
-                        log("  ✗ 生成视频失败，跳过")
-                        return@forEachIndexed
-                    }
-                    presentationTs = 2_000_000L
-                } else {
-                    log("  ✗ 不支持的文件类型，跳过")
-                    return@forEachIndexed
+                when {
+                    mime.startsWith("video/") -> handleVideo(engine, parentDir, uri, baseName, segUs)
+                    mime.startsWith("image/") -> handleImage(engine, parentDir, uri, baseName)
+                    else -> log("  ✗ 不支持的文件类型，跳过")
                 }
-
-                // 在选中的目录下创建/查找 Live图 子目录
-                val liveDir = parentDir.findFile("Live图")
-                    ?: parentDir.createDirectory("Live图")
-                    ?: parentDir
-                val outDoc = liveDir.createFile("image/jpeg", "$baseName.jpg")
-                    ?: run {
-                        log("  ✗ 无法创建输出文件（目录无写入权限）")
-                        return@forEachIndexed
-                    }
-                resolver.openOutputStream(outDoc.uri)?.use { os ->
-                    MotionPhotoWriter.wrap(cover!!, videoTmp!!, presentationTs, os)
-                }
-                log("  ✓ 完成，已保存到 ${selectedDirName}/Live图/${baseName}.jpg")
-                videoTmp?.delete()
             } catch (e: Exception) {
                 log("  ✗ 出错：${e.message}")
             }
@@ -181,6 +138,94 @@ class MainActivity : AppCompatActivity() {
             binding.convertBtn.isEnabled = true
             toast("转换完成")
         }
+    }
+
+    /** 图片：生成 2 秒缓慢放大的视频，封装成 1 个 Live 图 */
+    private fun handleImage(engine: MediaEngine, parentDir: DocumentFile, uri: Uri, baseName: String) {
+        val bmp = engine.decodeImage(uri, 1280)
+        if (bmp == null) {
+            log("  ✗ 无法解码图片，跳过")
+            return
+        }
+        val cover = engine.bitmapToJpeg(bmp, 92)
+        val videoTmp = File(cacheDir, "i_${System.currentTimeMillis()}.mp4")
+        engine.makeZoomVideo(bmp, videoTmp, 2.0f, 15, 0.035f)
+        bmp.recycle()
+        if (!videoTmp.exists() || videoTmp.length() == 0L) {
+            log("  ✗ 生成视频失败，跳过")
+            videoTmp.delete()
+            return
+        }
+        saveLivePhoto(engine, parentDir, cover, videoTmp, 2_000_000L, baseName, "")
+        videoTmp.delete()
+    }
+
+    /** 视频：按设定时长切成多段，每段生成 1 个 Live 图 */
+    private fun handleVideo(
+        engine: MediaEngine,
+        parentDir: DocumentFile,
+        uri: Uri,
+        baseName: String,
+        segUs: Long
+    ) {
+        val duration = engine.getVideoDurationUs(uri)
+        val segCount = if (duration != null && duration > segUs) {
+            ((duration + segUs - 1) / segUs).toInt()
+        } else 1
+
+        val durText = if (duration != null) String.format("%.2f", duration / 1_000_000.0) + " 秒" else "未知"
+        log("  视频时长：$durText，将切成 $segCount 段（每段约 ${segUs / 1_000_000} 秒）")
+
+        var okCount = 0
+        for (s in 0 until segCount) {
+            val startUs = s * segUs
+            val videoTmp = File(cacheDir, "v_${System.currentTimeMillis()}_$s.mp4")
+            log("  正在截取第 ${s + 1}/$segCount 段...")
+            val dur = engine.transmuxVideoSegment(uri, startUs, segUs, videoTmp)
+            if (dur == null || !videoTmp.exists() || videoTmp.length() == 0L) {
+                log("    ✗ 第 ${s + 1} 段截取失败，跳过")
+                videoTmp.delete()
+                continue
+            }
+            val cover = engine.extractCoverFromVideo(uri, startUs) ?: engine.extractCoverFromVideo(uri)
+            if (cover == null) {
+                log("    ✗ 第 ${s + 1} 段封面提取失败，跳过")
+                videoTmp.delete()
+                continue
+            }
+            val suffix = if (segCount > 1) "_${s + 1}" else ""
+            val saved = saveLivePhoto(engine, parentDir, cover, videoTmp, dur, baseName, suffix)
+            videoTmp.delete()
+            if (saved) okCount++
+        }
+
+        if (okCount == 0) log("  ✗ 所有分段都失败了")
+        else log("  ✓ 完成，已生成 $okCount 个 Live 图")
+    }
+
+    /** 在“Live图”子目录下写出封面 JPEG + MP4 封装的 Live 图 */
+    private fun saveLivePhoto(
+        engine: MediaEngine,
+        parentDir: DocumentFile,
+        cover: ByteArray,
+        videoFile: File,
+        presentationTs: Long,
+        baseName: String,
+        suffix: String
+    ): Boolean {
+        val liveDir = parentDir.findFile("Live图")
+            ?: parentDir.createDirectory("Live图")
+            ?: parentDir
+        val outDoc = liveDir.createFile("image/jpeg", "$baseName$suffix.jpg")
+            ?: run {
+                log("  ✗ 无法创建输出文件（目录无写入权限）")
+                return false
+            }
+        contentResolver.openOutputStream(outDoc.uri)?.use { os ->
+            MotionPhotoWriter.wrap(cover, videoFile, presentationTs, os)
+        }
+        log("  ✓ 已保存：${selectedDirName}/Live图/${baseName}${suffix}.jpg")
+        return true
     }
 
     private fun getDisplayName(uri: Uri): String {

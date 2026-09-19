@@ -54,6 +54,40 @@
         android:text="已选：0 个文件"
         android:textSize="14sp" />
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="长视频分段时长（秒）："
+            android:textSize="14sp"
+            android:textColor="#333333"
+            android:layout_gravity="center_vertical" />
+
+        <EditText
+            android:id="@+id/segEdit"
+            android:layout_width="80dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:inputType="number"
+            android:digits="1234567890"
+            android:maxLength="2"
+            android:text="3"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="（长视频会按此时长切成多段，每段生成一个 Live 图；图片与短视频忽略此设置）"
+        android:textSize="12sp"
+        android:textColor="#999999" />
+
     <Button
         android:id="@+id/convertBtn"
         android:layout_width="match_parent"

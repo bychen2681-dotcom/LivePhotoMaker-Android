@@ -60,13 +60,32 @@ class MediaEngine(private val context: Context) {
 
     /** 从视频提取首帧作为封面 JPEG（质量 92，与原脚本一致） */
     fun extractCoverFromVideo(uri: Uri): ByteArray? {
+        return extractCoverFromVideo(uri, 0L)
+    }
+
+    /** 从视频指定时间（微秒）提取一帧作为封面 JPEG */
+    fun extractCoverFromVideo(uri: Uri, timeUs: Long): ByteArray? {
         val retriever = MediaMetadataRetriever()
         return try {
             retriever.setDataSource(context, uri)
-            val bmp = retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return null
+            val bmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: return null
             val data = bitmapToJpeg(bmp, 92)
             bmp.recycle()
             data
+        } catch (e: Exception) {
+            null
+        } finally {
+            retriever.release()
+        }
+    }
+
+    /** 读取视频总时长（微秒）；失败返回 null */
+    fun getVideoDurationUs(uri: Uri): Long? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            val ms = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+            ms?.times(1000)
         } catch (e: Exception) {
             null
         } finally {
@@ -340,6 +359,112 @@ class MediaEngine(private val context: Context) {
             if (pts - firstPts > maxDurationUs) break
 
             // 保证 buffer 足够（API 28+ 可直接取 sampleSize）
+            val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                extractor.sampleSize.toInt()
+            } else 0
+            if (needed > buffer.capacity()) {
+                buffer = ByteBuffer.allocate(needed)
+            }
+
+            buffer.clear()
+            val size = extractor.readSampleData(buffer, 0)
+            if (size < 0) break
+
+            buffer.position(0)
+            buffer.limit(size)
+
+            val flags = extractor.sampleFlags
+            val outPts = pts - firstPts
+            val info = MediaCodec.BufferInfo().apply {
+                set(0, size, outPts, flags)
+            }
+            muxer.writeSampleData(trackIndex, buffer, info)
+
+            lastPts = outPts
+            samplesWritten++
+
+            if (!extractor.advance()) break
+        }
+
+        muxer.stop()
+        muxer.release()
+        extractor.release()
+
+        return if (samplesWritten > 0) lastPts else null
+    }
+
+    /**
+     * 截取视频中 [startUs, startUs+durationUs) 这一段，封装为 MP4（流拷贝、不重编码）。
+     * 先定位到 startUs 之前（或之上）最近的关键帧再开始写，保证开头是关键帧、不乱码。
+     * 返回该段实际时长（微秒，相对 0 起算）；失败返回 null。
+     */
+    fun transmuxVideoSegment(uri: Uri, startUs: Long, durationUs: Long, outFile: File): Long? {
+        val cr = context.contentResolver
+        val pfd = cr.openFileDescriptor(uri, "r") ?: return null
+        return try {
+            doTransmuxRange(pfd, startUs, durationUs, outFile)
+        } finally {
+            pfd.close()
+        }
+    }
+
+    private fun doTransmuxRange(
+        pfd: ParcelFileDescriptor,
+        startUs: Long,
+        durationUs: Long,
+        outFile: File
+    ): Long? {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(pfd.fileDescriptor)
+        } catch (e: Exception) {
+            extractor.release()
+            return null
+        }
+
+        var videoTrack = -1
+        var videoFormat: MediaFormat? = null
+        for (i in 0 until extractor.trackCount) {
+            val f = extractor.getTrackFormat(i)
+            val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
+            if (mime.startsWith("video/")) {
+                videoTrack = i
+                videoFormat = f
+                break
+            }
+        }
+        if (videoTrack < 0 || videoFormat == null) {
+            extractor.release()
+            return null
+        }
+
+        val rotation = if (videoFormat.containsKey(MediaFormat.KEY_ROTATION))
+            (videoFormat.getInteger(MediaFormat.KEY_ROTATION) + 360) % 360 else 0
+
+        extractor.selectTrack(videoTrack)
+        // 定位到 startUs 之前（或之上）最近的关键帧，作为本段的起点
+        extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        val firstPts = extractor.sampleTime
+        if (firstPts < 0) {
+            extractor.release()
+            return null
+        }
+
+        val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        muxer.setOrientationHint(rotation)
+        val trackIndex = muxer.addTrack(videoFormat)
+        muxer.start()
+
+        var buffer = ByteBuffer.allocate(8 * 1024 * 1024)
+        var samplesWritten = 0
+        var lastPts = 0L
+        val endUs = startUs + durationUs
+
+        while (true) {
+            val pts = extractor.sampleTime
+            if (pts < 0) break
+            if (pts > endUs) break
+
             val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 extractor.sampleSize.toInt()
             } else 0
