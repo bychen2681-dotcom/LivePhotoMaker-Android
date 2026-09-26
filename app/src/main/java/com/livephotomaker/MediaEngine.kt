@@ -22,6 +22,7 @@ import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.sin
+import kotlin.random.Random
 
 /**
  * 媒体处理引擎：对标原 Python 脚本（video_转Live图.py）
@@ -105,21 +106,33 @@ class MediaEngine(private val context: Context) {
      *  2) 锚点固定在几何中心，"完美对称"本身就不像自然拍摄。
      *
      * 本版改为模拟手持拍摄：
-     *  - 主运动 = 整幅画面的轻微平移 + 极小角度旋转（横向≈1.5%、纵向≈1.2% 画幅，旋转<0.2°）；
+     *  - 主运动 = 整幅画面的平移 + 微旋转（可选极缓慢的轻微推近），不做等比中心变焦；
      *  - 运动曲线 = 两组不同频率的正弦叠加（有机、非匀速），而非单一缓动曲线；
      *  - 用 sin(πt) 做包络，首帧/末帧回到原始取景 —— 封面与原始图片一致，播放无跳变；
      *  - 每帧按当时位移量动态计算最小安定裁切（overscan），既不出黑边，也把裁切压到最低。
      *
+     * 每次调用会从内置的 [MOTION_STYLES] 中**随机挑一种风格**，并随机化运动相位，
+     * 因此同一张图重复转换也会得到不同的动效，避免"一看就是同一套模板"的重复感。
+     *
      * @param durationSec 动效时长（秒），建议 3.0（与 iPhone 实况图一致）
      * @param fps         帧率，建议 30（运动更细腻，不会一卡一卡）
+     * @return 本次实际使用的风格名称（供上层日志展示）
      */
-    fun makeHandheldVideo(src: Bitmap, outFile: File, durationSec: Float, fps: Int) {
+    fun makeHandheldVideo(src: Bitmap, outFile: File, durationSec: Float, fps: Int): String {
         var width = (src.width / 2) * 2
         var height = (src.height / 2) * 2
         if (width <= 0) width = 2
         if (height <= 0) height = 2
 
         val totalFrames = max(2, (durationSec * fps).toInt())
+
+        // 随机挑一种内置风格；相位也随机化 → 同风格重复生成也不会一模一样
+        val style = MOTION_STYLES[Random.nextInt(MOTION_STYLES.size)]
+        val phases = floatArrayOf(
+            Random.nextFloat() * TAU,
+            Random.nextFloat() * TAU,
+            Random.nextFloat() * TAU
+        )
         val bitrate = (width * height * fps * 0.25).toInt().coerceIn(1_000_000, 8_000_000)
         val colorFormat = pickColorFormat()
 
@@ -156,7 +169,7 @@ class MediaEngine(private val context: Context) {
                 val inIdx = encoder.dequeueInputBuffer(10_000)
                 if (inIdx >= 0) {
                     if (frameIndex < totalFrames) {
-                        val motion = handheldMotion(frameIndex, totalFrames, width, height)
+                        val motion = handheldMotion(frameIndex, totalFrames, width, height, style, phases)
                         val frame = produceMotionFrame(base, motion, width, height)
                         val nv12 = bitmapToNV12(frame)
                         frame.recycle()
@@ -193,43 +206,74 @@ class MediaEngine(private val context: Context) {
         muxer.stop(); muxer.release()
         encoder.stop(); encoder.release()
         if (base != src) base.recycle()
+        return style.name
     }
 
     /** 单帧的手持变换参数 */
     private class MotionFrame(val scale: Float, val dx: Float, val dy: Float, val rotDeg: Float)
 
     /**
-     * 计算第 index 帧的手持变换。
-     * 位移/旋转都用 sin(πt) 包络 → 首末帧回到原始取景；
-     * 组内是两组"不可通约"频率的正弦叠加 → 自然、非匀速的有机漂移（避免机械感）。
-     * 裁切量按当帧位移实时计算，取"刚好不露黑边"的最小值。
+     * 内置手持运动风格。
+     *
+     * 位移/旋转都由「两组频率不可通约的正弦叠加」生成：
+     * 频率不成整数比 ⇒ 运动不会周期性重复，观感更有机、不像机械匀速推拉。
+     *
+     * @param ampX / ampY 横向 / 纵向位移幅度（占画幅比例，0.025 ≈ 2.5% 画宽）
+     * @param ampRot      旋转幅度（度）
+     * @param zoomAmp     缓慢推近幅度（0 = 完全不推近）
+     * @param fx1/fx2     横向运动的两组频率；wx1 为第一组权重（第二组为 1-wx1）
+     * @param fy1/fy2/wy1 纵向运动的频率与权重
+     * @param fr1/fr2/wr1 旋转运动的频率与权重
+     * @param offY1/offY2 纵向相对横向的相位偏移（频率相同且偏移为 0 ⇒ 斜向同相运动）
+     * @param offR1/offR2 旋转相对横向的相位偏移
+     * @param fz          推近运动的频率
      */
-    private fun handheldMotion(index: Int, totalFrames: Int, w: Int, h: Int): MotionFrame {
-        val pi = 3.14159265f
-        val tau = 6.2831855f
+    private class MotionStyle(
+        val name: String,
+        val ampX: Float, val ampY: Float, val ampRot: Float, val zoomAmp: Float,
+        val fx1: Float, val fx2: Float, val wx1: Float,
+        val fy1: Float, val fy2: Float, val wy1: Float,
+        val fr1: Float, val fr2: Float, val wr1: Float,
+        val offY1: Float, val offY2: Float,
+        val offR1: Float, val offR2: Float,
+        val fz: Float
+    )
+
+    /**
+     * 计算第 index 帧的手持变换。
+     * 位移/旋转/推近都乘 sin(πt) 包络 → 首末帧回到原始取景（封面与原图一致、播放无跳变）。
+     * 裁切量按当帧实际位移实时计算，取"刚好不露黑边"的最小值。
+     */
+    private fun handheldMotion(
+        index: Int, totalFrames: Int, w: Int, h: Int,
+        style: MotionStyle, phases: FloatArray
+    ): MotionFrame {
         val t = index.toFloat() / (totalFrames - 1).toFloat()
-        val env = sin(pi * t)                                   // 0 → 1 → 0
+        val env = sin(PI * t)                                   // 0 → 1 → 0
 
-        // 真实手持的大致量级：横向 1.5% 画宽、纵向 1.2% 画高、旋转 < 0.2°
-        val ampX = 0.015f * w
-        val ampY = 0.012f * h
-        val ampRotDeg = 0.18f
+        val dx = style.ampX * w * env *
+                wave(t, style.fx1, style.fx2, style.wx1, phases[0], phases[1])
+        val dy = style.ampY * h * env *
+                wave(t, style.fy1, style.fy2, style.wy1, phases[0] + style.offY1, phases[1] + style.offY2)
+        val rotDeg = style.ampRot * env *
+                wave(t, style.fr1, style.fr2, style.wr1, phases[0] + style.offR1, phases[1] + style.offR2)
 
-        val dx = ampX * env * (0.62f * sin(tau * 0.70f * t + 0.40f) +
-                               0.38f * sin(tau * 1.90f * t + 2.10f))
-        val dy = ampY * env * (0.65f * sin(tau * 0.55f * t + 1.70f) +
-                               0.35f * sin(tau * 1.60f * t + 4.20f))
-        val rotDeg = ampRotDeg * env * (0.60f * sin(tau * 0.45f * t + 0.90f) +
-                                        0.40f * sin(tau * 1.20f * t + 3.30f))
+        // 缓慢推近：0 → zoomAmp → 0（同受包络约束，首末帧不推近）
+        val zoom = style.zoomAmp * env * (0.5f + 0.5f * sin(TAU * style.fz * t + phases[2]))
 
         // 旋转会让四角额外位移约 r·θ，把它并入安全边距
-        val rotPx = 0.5f * hypot(w.toFloat(), h.toFloat()) * (abs(rotDeg) * pi / 180f)
+        val rotPx = 0.5f * hypot(w.toFloat(), h.toFloat()) * (abs(rotDeg) * PI / 180f)
         val needX = 2f * (abs(dx) + rotPx) / w
         val needY = 2f * (abs(dy) + rotPx) / h
-        val scale = 1f + max(needX, needY) + 0.004f             // 0.4% 兜底，防采样边缘露底
+        // 0.4% 兜底防采样边缘露底；推近本身只会裁得更多，不会露黑边
+        val scale = (1f + max(needX, needY) + 0.004f) * (1f + zoom)
 
         return MotionFrame(scale, dx, dy, rotDeg)
     }
+
+    /** 两组"不可通约"频率的正弦叠加：有机、非匀速，避免机械感 */
+    private fun wave(t: Float, f1: Float, f2: Float, w1: Float, p1: Float, p2: Float): Float =
+        w1 * sin(TAU * f1 * t + p1) + (1f - w1) * sin(TAU * f2 * t + p2)
 
     /** 绘制一帧：绕画幅中心缩放 → 绕中心旋转 → 平移（post 链顺序即变换施加顺序） */
     private fun produceMotionFrame(src: Bitmap, m: MotionFrame, w: Int, h: Int): Bitmap {
@@ -241,6 +285,60 @@ class MediaEngine(private val context: Context) {
         matrix.postTranslate(m.dx, m.dy)
         canvas.drawBitmap(src, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
         return out
+    }
+
+    private companion object {
+        private const val PI = 3.14159265f
+        private const val TAU = 6.2831855f
+
+        /**
+         * 内置的 5 种手持风格。差异体现在四个维度上：
+         * **速度**（频率高低）、**方向**（横 / 纵 / 斜向）、**幅度**、**是否带缓慢推近**。
+         *
+         * 每次生成随机取一种，并额外随机化运动相位，所以同一张图重复转换也不会一模一样。
+         */
+        private val MOTION_STYLES = listOf(
+            // ① 中速随手漂移：横纵都有、旋转轻微 —— 最接近日常随手拍的实况图
+            MotionStyle(
+                "自然手持", 0.022f, 0.017f, 0.24f, 0.000f,
+                0.70f, 1.90f, 0.62f,
+                0.55f, 1.60f, 0.65f,
+                0.45f, 1.20f, 0.60f,
+                1.30f, 2.10f, 0.50f, 1.20f, 0.00f
+            ),
+            // ② 慢速上下浮沉 + 极缓慢轻微推近 —— 像拍摄者在轻轻呼吸
+            MotionStyle(
+                "呼吸微推", 0.013f, 0.015f, 0.10f, 0.010f,
+                0.40f, 1.10f, 0.55f,
+                0.32f, 1.25f, 0.68f,
+                0.28f, 0.85f, 0.55f,
+                1.10f, 1.90f, 0.70f, 2.40f, 0.50f
+            ),
+            // ③ 慢速横移为主、纵向很弱 —— 像边走边拍，画面缓缓横向掠过
+            MotionStyle(
+                "漫步横移", 0.030f, 0.012f, 0.15f, 0.000f,
+                0.32f, 1.05f, 0.72f,
+                0.26f, 0.90f, 0.60f,
+                0.30f, 0.95f, 0.62f,
+                1.60f, 2.70f, 0.90f, 1.80f, 0.00f
+            ),
+            // ④ 频率偏高、旋转偏多 —— 像手不太稳的随手一拍，抖动感明显
+            MotionStyle(
+                "轻快微抖", 0.020f, 0.017f, 0.32f, 0.000f,
+                1.05f, 2.60f, 0.58f,
+                0.95f, 2.30f, 0.62f,
+                0.80f, 2.10f, 0.66f,
+                1.40f, 2.80f, 0.60f, 1.50f, 0.00f
+            ),
+            // ⑤ 横纵同频同相（相位偏移为 0）—— 画面斜向缓缓摇过
+            MotionStyle(
+                "斜向摇镜", 0.026f, 0.021f, 0.20f, 0.000f,
+                0.45f, 1.35f, 0.78f,
+                0.45f, 1.35f, 0.78f,
+                0.42f, 1.15f, 0.68f,
+                0.00f, 0.00f, 0.55f, 1.40f, 0.00f
+            )
+        )
     }
 
     /**

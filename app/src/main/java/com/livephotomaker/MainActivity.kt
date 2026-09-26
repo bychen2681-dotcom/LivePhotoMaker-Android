@@ -168,8 +168,9 @@ class MainActivity : AppCompatActivity() {
         }
         val cover = engine.bitmapToJpeg(bmp, 92)
         val videoTmp = File(cacheDir, "i_${System.currentTimeMillis()}.mp4")
-        log("  正在生成 3 秒手持微动效果（不做变焦放大，模拟真实实况图）...")
-        engine.makeHandheldVideo(bmp, videoTmp, 3.0f, 30)
+        log("  正在生成 3 秒手持微动效果（每次随机一种风格，模拟真实实况图）...")
+        val styleName = engine.makeHandheldVideo(bmp, videoTmp, 3.0f, 30)
+        log("  ✓ 本次动效风格：$styleName")
         bmp.recycle()
         if (!videoTmp.exists() || videoTmp.length() == 0L) {
             log("  ✗ 生成视频失败，跳过")
