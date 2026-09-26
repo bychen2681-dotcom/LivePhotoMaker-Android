@@ -24,6 +24,8 @@ class MainActivity : AppCompatActivity() {
     private var selectedDirUri: Uri? = null
     private var selectedDirName: String = "未选择"
     private var splitMode: Boolean = false
+    private var intensity: Float = 1.0f
+    private var intensityName: String = "标准"
     private val REQ_PICK = 1001
     private val REQ_PICK_DIR = 1002
 
@@ -48,6 +50,22 @@ class MainActivity : AppCompatActivity() {
             }
             override fun onNothingSelected(parent: AdapterView<*>) {}
         }
+
+        // 图片动效强度：只影响"图片 → Live 图"的晃动幅度，视频是原样截取，不受影响
+        val intensityNames = arrayOf("轻柔（最接近真实实况图）", "标准", "明显")
+        val intensityValues = floatArrayOf(0.6f, 1.0f, 1.5f)
+        val intensityAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, intensityNames)
+        intensityAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        binding.motionSpinner.adapter = intensityAdapter
+        binding.motionSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
+                intensity = intensityValues[position]
+                intensityName = intensityNames[position].substringBefore("（")
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>) {}
+        }
+        binding.motionSpinner.setSelection(1)   // 默认「标准」
     }
 
     private fun openDirPicker() {
@@ -168,9 +186,9 @@ class MainActivity : AppCompatActivity() {
         }
         val cover = engine.bitmapToJpeg(bmp, 92)
         val videoTmp = File(cacheDir, "i_${System.currentTimeMillis()}.mp4")
-        log("  正在生成 3 秒手持微动效果（每次随机一种风格，模拟真实实况图）...")
-        val styleName = engine.makeHandheldVideo(bmp, videoTmp, 3.0f, 30)
-        log("  ✓ 本次动效风格：$styleName")
+        log("  正在生成 3 秒真实手持晃动效果（相机三轴微转 + 恒定裁切，每次随机一种风格）...")
+        val styleName = engine.makeHandheldVideo(bmp, videoTmp, 3.0f, 30, intensity)
+        log("  ✓ 本次动效：$styleName · 强度 $intensityName")
         bmp.recycle()
         if (!videoTmp.exists() || videoTmp.length() == 0L) {
             log("  ✗ 生成视频失败，跳过")
