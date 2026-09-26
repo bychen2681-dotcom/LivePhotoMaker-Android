@@ -120,14 +120,18 @@ class MediaEngine(private val context: Context) {
      * 每次调用会从内置的 [MOTION_STYLES] 中**随机挑一种风格**，并随机化运动相位，
      * 因此同一张图重复转换也会得到不同的动效，避免"一看就是同一套模板"的重复感。
      *
+     * 注意：视频第一帧是"中心裁切 [HandheldResult.margin] 分之一"的画面，
+     * 所以**封面必须用 [cropCover] 做同样的裁切**，否则相册里静图是完整原图、
+     * 一播放画面就胀大，这个跳变本身就会被看成"放大"。
+     *
      * @param durationSec 动效时长（秒），建议 3.0（与 iPhone 实况图一致）
      * @param fps         帧率，建议 30（运动更细腻，不会一卡一卡）
      * @param intensity   动效强度倍数：0.6 轻柔（最接近真实实况图）/ 1.0 标准 / 1.5 明显
-     * @return 本次实际使用的风格名称（供上层日志展示）
+     * @return 本次实际使用的风格名称与恒定裁切系数
      */
     fun makeHandheldVideo(
         src: Bitmap, outFile: File, durationSec: Float, fps: Int, intensity: Float
-    ): String {
+    ): HandheldResult {
         var width = (src.width / 2) * 2
         var height = (src.height / 2) * 2
         if (width <= 0) width = 2
@@ -171,6 +175,7 @@ class MediaEngine(private val context: Context) {
         var inputDone = false
         var outputDone = false
         var pts = 0L
+        var coverJpeg: ByteArray? = null
 
         while (!outputDone) {
             if (!inputDone) {
@@ -179,6 +184,7 @@ class MediaEngine(private val context: Context) {
                     if (frameIndex < totalFrames) {
                         val motion = handheldMotion(frameIndex, totalFrames, style, phases, intensity)
                         val frame = produceMotionFrame(base, motion, margin)
+                        if (frameIndex == 0) coverJpeg = bitmapToJpeg(frame, 92)
                         val nv12 = bitmapToNV12(frame)
                         frame.recycle()
                         val inBuf = encoder.getInputBuffer(inIdx)!!
@@ -213,9 +219,22 @@ class MediaEngine(private val context: Context) {
 
         muxer.stop(); muxer.release()
         encoder.stop(); encoder.release()
+        // 取兜底封面必须在 recycle(base) 之前，否则会读到已回收的 Bitmap
+        val result = HandheldResult(style.name, margin, coverJpeg ?: bitmapToJpeg(base, 92))
         if (base != src) base.recycle()
-        return style.name
+        return result
     }
+
+    /**
+     * [makeHandheldVideo] 的返回值。
+     *
+     * [coverJpeg] 就是**视频第一帧本身**编码而来 —— 之所以不另外裁切原图当封面，
+     * 是因为两条重采样路径之间会有 1 像素级的网格差；直接用首帧才能保证
+     * "相册里看到的静图"和"播放出来的第一帧"严丝合缝，播放瞬间不会有任何缩放跳变。
+     */
+    class HandheldResult(
+        val styleName: String, val margin: Float, val coverJpeg: ByteArray
+    )
 
     /**
      * 单帧的相机姿态。
@@ -429,9 +448,9 @@ class MediaEngine(private val context: Context) {
          * 基准幅度（标准强度下的峰值，单位：度）。
          * 真手持拍 3 秒，三轴转动峰值通常就在 1° 上下 —— 超过 2° 就开始像"刻意摇晃"了。
          */
-        private const val BASE_YAW_DEG = 1.30f
-        private const val BASE_PITCH_DEG = 0.85f
-        private const val BASE_ROLL_DEG = 1.05f
+        private const val BASE_YAW_DEG = 1.60f
+        private const val BASE_PITCH_DEG = 1.05f
+        private const val BASE_ROLL_DEG = 1.30f
 
         /** 补充平移（占画幅比例，0.0010 = 0.1% 画宽）：只用来交代手臂摆动，绝不能大 */
         private const val BASE_PAN_X = 0.0010f

@@ -177,18 +177,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 图片：生成 3 秒「手持漂移感」视频（无变焦放大），封装成 1 个 Live 图 */
+    /** 图片：生成 3 秒「真实手持晃动」视频（透视旋转 + 恒定裁切，全程零缩放变化），封装成 1 个 Live 图 */
     private fun handleImage(engine: MediaEngine, parentDir: DocumentFile, uri: Uri, baseName: String) {
         val bmp = engine.decodeImage(uri, 1280)
         if (bmp == null) {
             log("  ✗ 无法解码图片，跳过")
             return
         }
-        val cover = engine.bitmapToJpeg(bmp, 92)
         val videoTmp = File(cacheDir, "i_${System.currentTimeMillis()}.mp4")
         log("  正在生成 3 秒真实手持晃动效果（相机三轴微转 + 恒定裁切，每次随机一种风格）...")
-        val styleName = engine.makeHandheldVideo(bmp, videoTmp, 3.0f, 30, intensity)
-        log("  ✓ 本次动效：$styleName · 强度 $intensityName")
+        val motion = engine.makeHandheldVideo(bmp, videoTmp, 3.0f, 30, intensity)
+        val cropPct = "%.1f".format((motion.margin - 1) * 100)
+        log("  ✓ 本次动效：${motion.styleName} · 强度 $intensityName · 恒定裁切 $cropPct%")
+        // 封面直接用视频首帧：保证"相册静图"与"播放第一帧"严丝合缝，播放瞬间不会胀大
+        val cover = motion.coverJpeg
         bmp.recycle()
         if (!videoTmp.exists() || videoTmp.length() == 0L) {
             log("  ✗ 生成视频失败，跳过")
