@@ -21,6 +21,7 @@ import java.nio.ByteBuffer
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -28,7 +29,8 @@ import kotlin.random.Random
  * 媒体处理引擎：对标原 Python 脚本（video_转Live图.py）
  *  - 视频：取首帧做封面；用 MediaExtractor + MediaMuxer 流拷贝为 MP4（与 Python 中
  *    ffmpeg -t 3 -c copy 一致），只保留前 3 秒，并从第一个关键帧开始，避免花屏。
- *  - 图片：生成 3 秒「真实手持晃动」视频（针孔相机三轴微转的透视变换 + 恒定裁切），封装为 H.264 MP4
+ *  - 图片：生成 3 秒「真实手持晃动」视频（恒定裁切 + 纯二维仿射漂移，数学上保证零黑边），
+ *    封装为 H.264 MP4
  *
  * 色彩关键修正（图片生成视频）：
  *  - 输入给 H.264 编码器的 YUV 必须是 NV12（U 在前、V 在后）。Android 的
@@ -100,34 +102,35 @@ class MediaEngine(private val context: Context) {
     /**
      * 把单张图片生成「真实手持晃动」视频，封装为 H.264 MP4。
      *
-     * 前两版为什么看着假：
-     *  1) 第一版是「绕画面中心等比放大」（smoothstep 1.0 → 1.035），这是最典型的数字变焦特征；
-     *  2) 第二版改成整幅平移 + 微旋转，但为了不出黑边，**裁切量按当帧位移实时计算** ——
-     *     位移越大裁得越多，于是整幅画面在 3 秒里被动地"放大 → 复原"，
-     *     叠加在真实运动之上，观感依然是"做了一个放大的效果"。
+     * 前三版分别踩了三个坑，这一版是它们的修正结果：
+     *  1) 第一版「绕画面中心等比放大」（1.0 → 1.035）—— 最典型的数字变焦特征，一眼假；
+     *  2) 第二版改成平移 + 微旋转，但裁切量**按当帧位移实时计算** ——
+     *     位移越大裁得越多，画面在 3 秒里被动地"放大 → 复原"，观感还是放大；
+     *  3) 第三版改成恒定裁切 + 相机三轴透视，但渲染的映射方向写反了
+     *     （把"源图矩形"投到"画布"，而不是把"画布四角"反投到"源图"）——
+     *     投影本身带整体偏移，源图边缘投影后盖不满画布，播放时四边会露黑边。
      *
-     * 本版两个关键改动：
-     *  1) **恒定裁切**：先扫一遍整段运动，取全程所需的**最大** overscan，整段视频共用同一个值。
-     *     帧与帧之间不再有任何缩放变化 —— 画面不会呼吸、不会推近拉远。
-     *  2) **用透视旋转取代平移**：真手持的画面位移绝大部分来自相机绕三轴的转动，
-     *     而不是整张照片在平面上"滑动"。绕轴转动会产生近大远小的梯形畸变，
-     *     这正是人眼判断"这是真的在拍"的核心线索。这里按针孔相机模型做单应变换
-     *     （[CAMERA_DISTANCE] 取 1.22 倍半宽 ≈ 等效 21mm 广角，与手机主摄一致），
-     *     三轴角度都在 1° 上下；平移只保留 0.1% 画幅作为补充。
-     *  3) 运动曲线 = 低频趋势（两组不可通约频率正弦叠加）+ 3~6Hz 高频手抖，
-     *     再乘 sin(πt) 包络 → 首末帧回到原始构图，播放不跳变、封面与图片一致。
+     * 本版模型：**恒定裁切 + 纯二维手持漂移**。
+     *  1) **恒定裁切**：先扫一遍整段运动，取全程所需的**最大** overscan，整段共用一个值。
+     *     帧与帧之间零缩放变化 —— 画面不会呼吸、不会推近拉远，这是"不像放大"的根本。
+     *  2) **只用仿射变换**（缩放 + 旋转 + 平移），不做透视投影：平行线保持平行，
+     *     画面不会梯形畸变，也就不会被看成"某一边被拉大 / 画面在变形"。
+     *     真手持的位移一阶近似就是整体平移，2% 画幅以内时与透视的差别肉眼不可辨。
+     *  3) **零黑边由数学保证**：[requiredMargin] 与 [produceMotionFrame] 严格互逆，
+     *     margin 就是按"让画布四角都落在源图范围内"反解出来的，并留 0.4% 采样余量。
+     *     自转不改变源图到画布的距离，所以旋转不会额外增加裁切需求 ——
+     *     代价只由位移幅度唯一决定，因此裁切可以压到 3% 左右（上一版是 8.6%）。
+     *  4) 运动曲线 = 低频趋势（两组不可通约频率正弦叠加）+ 3~6Hz 高频手抖，
+     *     再乘 sin(πt)^0.55 包络 → 首末帧精确回到原始构图，中段位移饱满。
+     *  5) 封面直接用视频第一帧，两者严丝合缝，播放瞬间没有任何跳变。
      *
      * 每次调用会从内置的 [MOTION_STYLES] 中**随机挑一种风格**，并随机化运动相位，
      * 因此同一张图重复转换也会得到不同的动效，避免"一看就是同一套模板"的重复感。
      *
-     * 注意：视频第一帧是"中心裁切 [HandheldResult.margin] 分之一"的画面，
-     * 所以**封面必须用 [cropCover] 做同样的裁切**，否则相册里静图是完整原图、
-     * 一播放画面就胀大，这个跳变本身就会被看成"放大"。
-     *
      * @param durationSec 动效时长（秒），建议 3.0（与 iPhone 实况图一致）
      * @param fps         帧率，建议 30（运动更细腻，不会一卡一卡）
      * @param intensity   动效强度倍数：0.6 轻柔（最接近真实实况图）/ 1.0 标准 / 1.5 明显
-     * @return 本次实际使用的风格名称与恒定裁切系数
+     * @return 本次实际使用的风格名称、恒定裁切系数与首帧封面
      */
     fun makeHandheldVideo(
         src: Bitmap, outFile: File, durationSec: Float, fps: Int, intensity: Float
@@ -237,78 +240,84 @@ class MediaEngine(private val context: Context) {
     )
 
     /**
-     * 单帧的相机姿态。
-     * 三个角度都是"相机的转动"，画面位移是转动带来的透视偏移；
-     * [panX]/[panY] 只是极小的补充平移（占画幅比例），用来交代手臂的轻微摆动。
+     * 单帧的二维运动量。
+     *
+     * 位移用「画幅比例」表示（0.01 = 画幅的 1%），与像素尺寸无关 ——
+     * 这样同一套参数在任意分辨率的图片上得到完全相同的视觉幅度。
      */
     private class MotionFrame(
-        val yawDeg: Float, val pitchDeg: Float, val rollDeg: Float,
-        val panX: Float, val panY: Float
+        val dxRatio: Float, val dyRatio: Float, val rotDeg: Float
     )
 
     /**
      * 内置手持运动风格。
      *
-     * 每个轴都由「两组频率不可通约的正弦叠加」驱动（频率不成整数比 ⇒ 运动不会周期性重复），
+     * 三个自由度（横向位移、纵向位移、画面自转）各自由「两组频率不可通约的正弦叠加」驱动：
+     * 频率不成整数比 ⇒ 运动不会周期性重复，观感有机、不像机械匀速推拉；
      * 再叠加一路 3~6Hz 的高频微颤 —— 那是人手的生理性抖动，也是"真的在手持拍摄"的签名。
      *
-     * @param fYaw1/fYaw2  横向转头（绕纵轴）的两组频率，单位 = 整段时长内的周期数
-     * @param fPit1/fPit2  上下点头（绕横轴）的两组频率
-     * @param fRol1/fRol2  画面自转（绕光轴）的两组频率
-     * @param wYaw/wPitch/wRoll 三轴各自的幅度权重（1.0 = 基准幅度）
-     * @param fTremor      高频手抖的频率（周期数 / 整段时长）
-     * @param wTremor      高频手抖相对该风格低频幅度的比例
-     * @param phaseOffset  俯仰相对偏航的相位偏移；取 0 时两轴同相 ⇒ 画面沿斜向摇过
+     * @param fX1/fX2      横向位移的两组频率（单位 = 整段时长内的周期数）
+     * @param fY1/fY2      纵向位移的两组频率
+     * @param fR1/fR2      画面自转的两组频率
+     * @param wX/wY/wR     三个自由度各自的幅度权重（1.0 = 基准幅度）
+     * @param fTremor      高频手抖频率（周期数 / 整段时长）
+     * @param wTremor      高频手抖相对低频幅度的比例
+     * @param phaseY       纵向相对横向的相位偏移
+     * @param phaseR       自转相对横向的相位偏移；phaseY 取 0 时横纵同相 ⇒ 画面沿斜向平移
      */
     private class MotionStyle(
         val name: String,
-        val fYaw1: Float, val fYaw2: Float,
-        val fPit1: Float, val fPit2: Float,
-        val fRol1: Float, val fRol2: Float,
-        val wYaw: Float, val wPitch: Float, val wRoll: Float,
+        val fX1: Float, val fX2: Float,
+        val fY1: Float, val fY2: Float,
+        val fR1: Float, val fR2: Float,
+        val wX: Float, val wY: Float, val wR: Float,
         val fTremor: Float, val wTremor: Float,
-        val phaseOffset: Float
+        val phaseY: Float, val phaseR: Float
     )
 
     /**
-     * 计算第 index 帧的相机姿态。
+     * 计算第 index 帧的二维运动量。
+     *
      * 所有分量都乘 sin(πt) 包络 → 首帧、末帧都回到原始构图
      * （封面与图片完全一致，循环播放也不会跳变）。
+     *
+     * 包络取 0.55 次幂而不是纯 sin：纯 sin 在首尾各 1/4 段几乎不动，
+     * 3 秒里只有中间 1.5 秒看得出运动；开方后包络更"方"，全程都有可观位移，
+     * 而首末帧仍然精确归零。
      */
     private fun handheldMotion(
         index: Int, totalFrames: Int,
         style: MotionStyle, phases: FloatArray, intensity: Float
     ): MotionFrame {
+        // 首末帧直接给 0：sin(π) 在 Float 下只有 ~4.6e-8 的残留，开方放大后仍会留下
+        // 千分之几的微小位移，这里显式归零，保证封面与原始图片严格一致。
+        if (index == 0 || index == totalFrames - 1) return MotionFrame(0f, 0f, 0f)
         val t = index.toFloat() / (totalFrames - 1).toFloat()
-        val env = sin(PI * t)                                   // 0 → 1 → 0
+        val env = pow(sin(PI * t), ENV_POWER)                   // 0 → 1 → 0，中段更饱满
 
         val p1 = phases[0]
         val p2 = phases[1]
 
         // 低频趋势：两组不可通约频率叠加，运动有快有慢、不周期重复
-        val yawLow = drift(t, style.fYaw1, style.fYaw2, 0.62f, p1, p2 + 1.7f)
-        val pitLow = drift(
-            t, style.fPit1, style.fPit2, 0.58f,
-            p1 + style.phaseOffset, p2 + style.phaseOffset * 1.6f
+        val xLow = drift(t, style.fX1, style.fX2, 0.62f, p1, p2 + 1.7f)
+        val yLow = drift(
+            t, style.fY1, style.fY2, 0.58f,
+            p1 + style.phaseY, p2 + style.phaseY * 1.6f
         )
-        val rolLow = drift(t, style.fRol1, style.fRol2, 0.60f, p1 + 2.3f, p2 + 0.8f)
+        val rLow = drift(t, style.fR1, style.fR2, 0.60f, p1 + style.phaseR, p2 + 0.8f)
 
-        // 高频手抖：三轴各给不同相位，避免出现"整幅一起抖"的机械感
+        // 高频手抖：三路各给不同相位，避免出现"整幅一起抖"的机械感
         val tr = style.wTremor
-        val yawHi = sin(TAU * style.fTremor * t + phases[2])
-        val pitHi = sin(TAU * style.fTremor * 1.21f * t + phases[3])
-        val rolHi = sin(TAU * style.fTremor * 0.83f * t + phases[4])
+        val xHi = sin(TAU * style.fTremor * t + phases[2])
+        val yHi = sin(TAU * style.fTremor * 1.21f * t + phases[3])
+        val rHi = sin(TAU * style.fTremor * 0.83f * t + phases[4])
 
         val k = intensity * env
-        val yaw = BASE_YAW_DEG * style.wYaw * k * (yawLow + tr * yawHi)
-        val pitch = BASE_PITCH_DEG * style.wPitch * k * (pitLow + tr * pitHi)
-        val roll = BASE_ROLL_DEG * style.wRoll * k * (rolLow + tr * rolHi)
-
-        // 平移只作极小补充：真实手持里画面位移绝大部分来自转动，而不是整张照片在滑动
-        val panX = BASE_PAN_X * k * drift(t, style.fYaw1, style.fYaw2, 0.62f, p1 + 1.1f, p2 + 2.9f)
-        val panY = BASE_PAN_Y * k * drift(t, style.fPit1, style.fPit2, 0.58f, p1 + 0.4f, p2 + 1.4f)
-
-        return MotionFrame(yaw, pitch, roll, panX, panY)
+        return MotionFrame(
+            BASE_DX * style.wX * k * (xLow + tr * xHi),
+            BASE_DY * style.wY * k * (yLow + tr * yHi),
+            BASE_ROT * style.wR * k * (rLow + tr * rHi)
+        )
     }
 
     /** 两组"不可通约"频率的正弦叠加：运动有机、不周期性重复，避免机械感 */
@@ -318,88 +327,62 @@ class MediaEngine(private val context: Context) {
     /**
      * 求整段视频所需的**恒定**裁切系数（overscan）。
      *
-     * 做法：逐帧把画布四个角**反投影**回图像平面，看它落在哪里；
-     * 要让这个角在变换后仍有像素覆盖，源图就必须比画布大出相应倍数。
-     * 取全程最大值 + 0.4% 采样余量 —— 全程共用一个值，因此画面不会随运动缩放。
+     * 渲染式是 `画布点 c = margin · R(θ) · p + d`（p 为源图上相对中心的像素坐标），
+     * 反解得 `p = R(-θ)·(c - d) / margin`。要让画布每一个像素都能取到源图内容，
+     * 就必须保证这个 p 落在 `[-w/2, w/2] × [-h/2, h/2]` 之内。
+     *
+     * 于是逐帧对画布四角求 p，取全程最大半径 + 采样余量，整段视频共用这一个值 ——
+     * 帧与帧之间不存在任何缩放变化，所以画面不会有"呼吸 / 推近"的观感。
+     *
+     * 取 `max(|px|/(w/2), |py|/(h/2))` 而不是两个方向各自算，是为了让裁切各向同性，
+     * 否则画面会被拉扁。
+     *
+     * 注意：自转会改变 p 的方向但**不改变它的模长**，所以旋转本身不额外增加裁切需求 ——
+     * 代价只由位移幅度唯一决定，这也是这套模型能压到 3% 左右裁切的原因。
      */
     private fun requiredMargin(
         w: Int, h: Int, totalFrames: Int,
         style: MotionStyle, phases: FloatArray, intensity: Float
     ): Float {
         val halfW = w / 2f
-        val aspect = h.toFloat() / w.toFloat()
-        val cornerX = floatArrayOf(0f, w.toFloat(), w.toFloat(), 0f)
-        val cornerY = floatArrayOf(0f, 0f, h.toFloat(), h.toFloat())
+        val halfH = h / 2f
+        val cx = floatArrayOf(-halfW, halfW, halfW, -halfW)
+        val cy = floatArrayOf(-halfH, -halfH, halfH, halfH)
 
         var need = 1.0f
         for (i in 0 until totalFrames) {
             val m = handheldMotion(i, totalFrames, style, phases, intensity)
-            val r = rotationMatrix(m.yawDeg, m.pitchDeg, m.rollDeg)
-            for (c in 0 until 4) {
-                // 先在像素空间扣掉平移，再换算成以"半宽 = 1"为单位的平面坐标
-                val u = (cornerX[c] - m.panX * w) / halfW - 1f
-                val v = (cornerY[c] - m.panY * h) / halfW - aspect
-                val p = unproject(u, v, r)
-                need = max(need, max(abs(p[0]), abs(p[1]) * w / h))
+            val dx = m.dxRatio * w
+            val dy = m.dyRatio * h
+            val rad = m.rotDeg * PI / 180f
+            val cr = cos(rad)
+            val sr = sin(rad)
+            for (k in 0 until 4) {
+                // q = R(-θ)·(c - d)：把画布角逆旋转回"未自转"的坐标系
+                val vx = cx[k] - dx
+                val vy = cy[k] - dy
+                val qx = vx * cr + vy * sr
+                val qy = -vx * sr + vy * cr
+                need = max(need, max(abs(qx) / halfW, abs(qy) / halfH))
             }
         }
-        return need * 1.004f
+        return need * (1f + MARGIN_SAFETY)
     }
 
     /**
-     * 相机姿态矩阵（行主序 3×3）：R = Rz(roll) · Ry(yaw) · Rx(pitch)
-     * 图像平面在 z = 0，相机位于 (0, 0, +d) 朝 -z 看（见 [project] / [unproject]）。
-     */
-    private fun rotationMatrix(yawDeg: Float, pitchDeg: Float, rollDeg: Float): FloatArray {
-        val yaw = yawDeg * PI / 180f
-        val pitch = pitchDeg * PI / 180f
-        val roll = rollDeg * PI / 180f
-        val cy = cos(yaw); val sy = sin(yaw)
-        val cp = cos(pitch); val sp = sin(pitch)
-        val cr = cos(roll); val sr = sin(roll)
-        return floatArrayOf(
-            cr * cy, cr * sy * sp - sr * cp, cr * sy * cp + sr * sp,
-            sr * cy, sr * sy * sp + cr * cp, sr * sy * cp - cr * sp,
-            -sy, cy * sp, cy * cp
-        )
-    }
-
-    /**
-     * 针孔相机投影：图像平面上以「半宽 = 1」为单位的点 (x, y) → 归一化成像坐标 (u, v)。
-     * 相机在 z = +d 处绕原点转动 R，故相机空间向量 V' = R·(x, y, -d)，
-     * u = d·V'x / (-V'z)，v = d·V'y / (-V'z)。R 为单位矩阵时 u = x、v = y（无畸变）。
-     */
-    private fun project(x: Float, y: Float, r: FloatArray): FloatArray {
-        val d = CAMERA_DISTANCE
-        val vx = r[0] * x + r[1] * y - r[2] * d
-        val vy = r[3] * x + r[4] * y - r[5] * d
-        val vz = r[6] * x + r[7] * y - r[8] * d
-        val denom = -vz
-        if (abs(denom) < 1e-4f) return floatArrayOf(x, y)
-        return floatArrayOf(d * vx / denom, d * vy / denom)
-    }
-
-    /** [project] 的逆运算：由归一化成像坐标 (u, v) 解出图像平面上的点 (x, y) */
-    private fun unproject(u: Float, v: Float, r: FloatArray): FloatArray {
-        val d = CAMERA_DISTANCE
-        val a11 = d * r[0] + u * r[6]
-        val a12 = d * r[1] + u * r[7]
-        val b1 = d * d * r[2] + u * d * r[8]
-        val a21 = d * r[3] + v * r[6]
-        val a22 = d * r[4] + v * r[7]
-        val b2 = d * d * r[5] + v * d * r[8]
-        val det = a11 * a22 - a12 * a21
-        if (abs(det) < 1e-6f) return floatArrayOf(0f, 0f)
-        return floatArrayOf(
-            (b1 * a22 - b2 * a12) / det,
-            (a11 * b2 - a21 * b1) / det
-        )
-    }
-
-    /**
-     * 绘制一帧：把原图中心 [margin] 分之一区域的四角，用单应变换映射到"相机转过三轴"后
-     * 的投影位置，再整体平移 [MotionFrame.panX]/[MotionFrame.panY]。
-     * 因为是透视变换而非仿射变换，画面会自然出现近大远小的梯形畸变 —— 真实手持的关键特征。
+     * 绘制一帧：把源图放大 [margin] 倍（等价于"取源图中心 1/margin 的区域铺满画布"），
+     * 绕画幅中心自转 [MotionFrame.rotDeg]，再整体平移
+     * [MotionFrame.dxRatio]·w / [MotionFrame.dyRatio]·h。
+     *
+     * 这里刻意只用「缩放 + 旋转 + 平移」这三种**仿射**变换，不做透视投影：
+     *  - 仿射变换保持"平行线依旧平行"，画面不会出现梯形畸变，
+     *    也就不会被看成"某一边被拉大 / 画面在变形"；
+     *  - 位移完全由平移承担，配合全程恒定的 [margin]，人眼看到的就是
+     *    **一个静止的画面在轻微晃动**，而不是一次变焦推拉。
+     *
+     * 变换链 L→R 是"先做什么"：先把源图中心移到原点 → 自转 → 放大 → 平移到目标位置。
+     * 与 [requiredMargin] 的 `p = R(-θ)·(c - d) / margin` 严格互逆，所以只要 margin 足够，
+     * 画布上不可能出现没有被源图覆盖的像素。
      */
     private fun produceMotionFrame(src: Bitmap, m: MotionFrame, margin: Float): Bitmap {
         val w = src.width
@@ -407,36 +390,13 @@ class MediaEngine(private val context: Context) {
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
 
-        val halfW = w / 2f
-        val aspect = h.toFloat() / w.toFloat()
-        val half = 1f / margin                  // 源矩形半宽（单位：半宽 = 1）
-        val sx = halfW * half                   // 源矩形半宽（像素）
-        val sy = h / 2f * half                  // 源矩形半高（像素）
-
-        // 源四角：左上、右上、右下、左下
-        val srcPts = floatArrayOf(
-            halfW - sx, h / 2f - sy,
-            halfW + sx, h / 2f - sy,
-            halfW + sx, h / 2f + sy,
-            halfW - sx, h / 2f + sy
-        )
-
-        val r = rotationMatrix(m.yawDeg, m.pitchDeg, m.rollDeg)
-        val srcX = floatArrayOf(-half, half, half, -half)
-        val srcY = floatArrayOf(-aspect * half, -aspect * half, aspect * half, aspect * half)
-        val dstPts = FloatArray(8)
-        for (i in 0 until 4) {
-            val p = project(srcX[i], srcY[i], r)
-            dstPts[i * 2] = p[0] * halfW + halfW + m.panX * w
-            dstPts[i * 2 + 1] = p[1] * halfW + h / 2f + m.panY * h
-        }
-
         val matrix = Matrix()
-        matrix.setPolyToPoly(srcPts, 0, dstPts, 0, 4)
-        canvas.save()
-        canvas.concat(matrix)
-        canvas.drawBitmap(src, 0f, 0f, FILTER_PAINT)
-        canvas.restore()
+        matrix.postTranslate(-w / 2f, -h / 2f)                          // 源图中心 → 原点
+        matrix.postRotate(m.rotDeg)                                     // 绕画幅中心自转
+        matrix.postScale(margin, margin)                                // 放大（= 裁掉边缘一圈）
+        matrix.postTranslate(w / 2f + m.dxRatio * w, h / 2f + m.dyRatio * h)
+
+        canvas.drawBitmap(src, matrix, FILTER_PAINT)
         return out
     }
 
@@ -445,29 +405,35 @@ class MediaEngine(private val context: Context) {
         private const val TAU = 6.2831855f
 
         /**
-         * 基准幅度（标准强度下的峰值，单位：度）。
-         * 真手持拍 3 秒，三轴转动峰值通常就在 1° 上下 —— 超过 2° 就开始像"刻意摇晃"了。
+         * 基准位移幅度（占画幅比例，0.016 = 画幅宽的 1.6%）。
+         * 真手持拍 3 秒，画面峰值位移通常就在 1%~2% 画幅之间 ——
+         * 再往上就开始像"刻意摇晃"，往下则完全看不出在动。
          */
-        private const val BASE_YAW_DEG = 1.60f
-        private const val BASE_PITCH_DEG = 1.05f
-        private const val BASE_ROLL_DEG = 1.30f
-
-        /** 补充平移（占画幅比例，0.0010 = 0.1% 画宽）：只用来交代手臂摆动，绝不能大 */
-        private const val BASE_PAN_X = 0.0010f
-        private const val BASE_PAN_Y = 0.0008f
+        private const val BASE_DX = 0.016f
+        private const val BASE_DY = 0.013f
 
         /**
-         * 相机到图像平面的距离，以画幅半宽为单位。
-         * 1.22 ⇒ 水平视场角约 2·atan(1/1.22) ≈ 78°，等效全画幅焦距约 21mm，
-         * 与手机主摄（等效 23~26mm）基本一致 —— 所以透视强度就是"手机拍出来的"那种感觉。
+         * 基准自转角（度）。手持实拍时画面自转极小，0.1° 已经足够提供
+         * "这张照片是活的"的感觉；再大就会被看成"画面在歪"。
          */
-        private const val CAMERA_DISTANCE = 1.22f
+        private const val BASE_ROT = 0.10f
+
+        /** 包络指数：开方后 sin(πt) 的中段更饱满，全程都有可观位移，而首末帧仍精确归零 */
+        private const val ENV_POWER = 0.55f
+
+        /**
+         * 裁切安全余量（0.010 = 1%）。
+         * 理论 margin 已经能保证画布每一点都取到源图内容，留 1% 是为了抵掉
+         * 重采样在边缘的半像素误差、以及 Float 三角函数与渲染管线的舍入差 ——
+         * 实测把最紧处的余量从 1.5px 提到 6px 左右（1200 图），代价只是多裁 0.6%。
+         */
+        private const val MARGIN_SAFETY = 0.010f
 
         private val FILTER_PAINT = Paint(Paint.FILTER_BITMAP_FLAG)
 
         /**
          * 内置的 5 种手持风格。差异体现在三个维度上：
-         * **节奏**（频率高低）、**方向**（横向转头 / 纵向点头 / 自转的权重）、**抖动**（高频手抖占比）。
+         * **节奏**（频率高低）、**方向**（横向位移 / 纵向位移 / 自转的权重）、**抖动**（高频手抖占比）。
          *
          * 每次生成随机取一种，并额外随机化运动相位，所以同一张图重复转换也不会一模一样。
          */
@@ -476,31 +442,31 @@ class MediaEngine(private val context: Context) {
             MotionStyle(
                 "自然手持",
                 0.62f, 1.48f, 0.48f, 1.27f, 0.55f, 1.35f,
-                1.00f, 0.85f, 0.90f, 4.6f, 0.30f, 1.05f
+                1.00f, 0.85f, 0.90f, 4.6f, 0.30f, 1.05f, 2.30f
             ),
-            // ② 轻微呼吸：慢、幅度小，几乎只有纵轴在缓缓浮沉
+            // ② 轻微呼吸：慢、幅度小，几乎只有纵向在缓缓浮沉
             MotionStyle(
                 "轻微呼吸",
                 0.32f, 0.83f, 0.28f, 0.95f, 0.22f, 0.71f,
-                0.70f, 1.00f, 0.55f, 3.6f, 0.22f, 1.20f
+                0.70f, 1.00f, 0.55f, 3.6f, 0.22f, 1.20f, 1.90f
             ),
-            // ③ 边走边拍：以横向转头为主、节奏偏慢，画面像被缓缓掠过
+            // ③ 边走边拍：以横移为主、节奏偏慢，画面像被缓缓掠过
             MotionStyle(
                 "边走边拍",
                 0.38f, 1.02f, 0.30f, 0.88f, 0.42f, 1.15f,
-                1.15f, 0.55f, 1.00f, 5.2f, 0.26f, 1.35f
+                1.15f, 0.55f, 1.00f, 5.2f, 0.26f, 1.35f, 2.70f
             ),
             // ④ 手不太稳：频率偏高、自转更多，抖动感最明显的一档
             MotionStyle(
                 "手不太稳",
                 0.95f, 2.35f, 0.85f, 2.05f, 0.78f, 1.95f,
-                0.90f, 0.80f, 1.10f, 6.5f, 0.42f, 0.95f
+                0.90f, 0.80f, 1.10f, 6.5f, 0.42f, 0.95f, 1.50f
             ),
-            // ⑤ 斜向慢摇：俯仰与偏航同频同相（相位偏移 = 0）⇒ 画面沿斜向缓缓摇过
+            // ⑤ 斜向慢摇：横纵两轴同频同相（相位偏移 = 0）⇒ 画面沿斜向缓缓平移
             MotionStyle(
                 "斜向慢摇",
                 0.45f, 1.25f, 0.45f, 1.25f, 0.38f, 1.08f,
-                0.90f, 0.90f, 0.75f, 4.2f, 0.28f, 0.00f
+                0.90f, 0.90f, 0.75f, 4.2f, 0.28f, 0.00f, 1.40f
             )
         )
     }

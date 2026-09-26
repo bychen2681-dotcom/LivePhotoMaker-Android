@@ -46,6 +46,8 @@ class MainActivity : AppCompatActivity() {
             override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
                 splitMode = position == 1
                 binding.segContainer.visibility = if (splitMode) View.VISIBLE else View.GONE
+                // 动效强度只作用于「图片 → Live 图」，切割模式全是视频，这项无意义，直接隐藏
+                binding.motionContainer.visibility = if (splitMode) View.GONE else View.VISIBLE
                 binding.selectBtn.text = if (splitMode) "选择视频（可多选）" else "选择图片 / 视频（可多选）"
             }
             override fun onNothingSelected(parent: AdapterView<*>) {}

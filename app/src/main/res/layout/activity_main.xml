@@ -54,28 +54,35 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp" />
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="图片动效强度（仅对图片生效）"
-        android:textSize="15sp"
-        android:textStyle="bold"
-        android:textColor="#222222" />
-
-    <Spinner
-        android:id="@+id/motionSpinner"
+    <LinearLayout
+        android:id="@+id/motionContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp" />
+        android:layout_marginTop="12dp"
+        android:orientation="vertical">
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="2dp"
-        android:text="晃动幅度。觉得假就调「轻柔」，觉得没动感就调「明显」"
-        android:textSize="12sp"
-        android:textColor="#999999" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="图片动效强度（仅对图片生效）"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="#222222" />
+
+        <Spinner
+            android:id="@+id/motionSpinner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="晃动幅度。觉得假就调「轻柔」，觉得没动感就调「明显」"
+            android:textSize="12sp"
+            android:textColor="#999999" />
+    </LinearLayout>
 
     <Button
         android:id="@+id/selectBtn"
