@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write       # 允许创建 Release 并上传 APK 附件（便于匿名下载）
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -44,3 +46,17 @@ jobs:
         with:
           name: LivePhotoMaker-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: 重命名 APK（带构建号，便于区分版本）
+        run: cp app/build/outputs/apk/debug/app-debug.apk LivePhotoMaker-${{ github.run_number }}.apk
+
+      - name: 发布 Release（供匿名下载 APK）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: LivePhotoMaker build ${{ github.run_number }}
+          body: |
+            自动构建产出的 Live 图生成器安装包。
+            构建号：${{ github.run_number }}
+            提交：${{ github.sha }}
+          files: LivePhotoMaker-${{ github.run_number }}.apk

@@ -159,7 +159,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 图片：生成 2 秒缓慢放大的视频，封装成 1 个 Live 图 */
+    /** 图片：生成 3 秒「手持漂移感」视频（无变焦放大），封装成 1 个 Live 图 */
     private fun handleImage(engine: MediaEngine, parentDir: DocumentFile, uri: Uri, baseName: String) {
         val bmp = engine.decodeImage(uri, 1280)
         if (bmp == null) {
@@ -168,14 +168,15 @@ class MainActivity : AppCompatActivity() {
         }
         val cover = engine.bitmapToJpeg(bmp, 92)
         val videoTmp = File(cacheDir, "i_${System.currentTimeMillis()}.mp4")
-        engine.makeZoomVideo(bmp, videoTmp, 2.0f, 15, 0.035f)
+        log("  正在生成 3 秒手持微动效果（不做变焦放大，模拟真实实况图）...")
+        engine.makeHandheldVideo(bmp, videoTmp, 3.0f, 30)
         bmp.recycle()
         if (!videoTmp.exists() || videoTmp.length() == 0L) {
             log("  ✗ 生成视频失败，跳过")
             videoTmp.delete()
             return
         }
-        saveLivePhoto(engine, parentDir, cover, videoTmp, 2_000_000L, baseName, "")
+        saveLivePhoto(engine, parentDir, cover, videoTmp, 3_000_000L, baseName, "")
         videoTmp.delete()
     }
 

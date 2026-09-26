@@ -18,13 +18,16 @@ import android.os.ParcelFileDescriptor
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
+import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.sin
 
 /**
  * 媒体处理引擎：对标原 Python 脚本（video_转Live图.py）
  *  - 视频：取首帧做封面；用 MediaExtractor + MediaMuxer 流拷贝为 MP4（与 Python 中
  *    ffmpeg -t 3 -c copy 一致），只保留前 3 秒，并从第一个关键帧开始，避免花屏。
- *  - 图片：生成 2 秒缓慢放大的视频（smoothstep 缓动），封装为 H.264 MP4
+ *  - 图片：生成 3 秒「手持漂移感」视频（整幅轻微平移+微旋转，不做变焦放大），封装为 H.264 MP4
  *
  * 色彩关键修正（图片生成视频）：
  *  - 输入给 H.264 编码器的 YUV 必须是 NV12（U 在前、V 在后）。Android 的
@@ -94,10 +97,23 @@ class MediaEngine(private val context: Context) {
     }
 
     /**
-     * 把单张图片生成「缓慢放大」视频（smoothstep 缓动），封装为 H.264 MP4。
-     * 参数对标原脚本：durationSec=2.0, fps=15, maxZoom=0.035
+     * 把单张图片生成「手持漂移感」视频，封装为 H.264 MP4。
+     *
+     * 旧版是「以画面正中心等比放大」（smoothstep 1.0 → 1.035），看起来假的原因是：
+     *  1) 纯中心缩放会让每个像素沿半径等比例向外扩散，这是典型的"数字变焦"特征；
+     *     而真实手持拍的实况图几乎不变焦，是整幅画面在轻微位移；
+     *  2) 锚点固定在几何中心，"完美对称"本身就不像自然拍摄。
+     *
+     * 本版改为模拟手持拍摄：
+     *  - 主运动 = 整幅画面的轻微平移 + 极小角度旋转（横向≈1.5%、纵向≈1.2% 画幅，旋转<0.2°）；
+     *  - 运动曲线 = 两组不同频率的正弦叠加（有机、非匀速），而非单一缓动曲线；
+     *  - 用 sin(πt) 做包络，首帧/末帧回到原始取景 —— 封面与原始图片一致，播放无跳变；
+     *  - 每帧按当时位移量动态计算最小安定裁切（overscan），既不出黑边，也把裁切压到最低。
+     *
+     * @param durationSec 动效时长（秒），建议 3.0（与 iPhone 实况图一致）
+     * @param fps         帧率，建议 30（运动更细腻，不会一卡一卡）
      */
-    fun makeZoomVideo(src: Bitmap, outFile: File, durationSec: Float, fps: Int, maxZoom: Float) {
+    fun makeHandheldVideo(src: Bitmap, outFile: File, durationSec: Float, fps: Int) {
         var width = (src.width / 2) * 2
         var height = (src.height / 2) * 2
         if (width <= 0) width = 2
@@ -140,10 +156,8 @@ class MediaEngine(private val context: Context) {
                 val inIdx = encoder.dequeueInputBuffer(10_000)
                 if (inIdx >= 0) {
                     if (frameIndex < totalFrames) {
-                        val t = frameIndex.toFloat() / (totalFrames - 1)
-                        val ease = t * t * (3 - 2 * t)            // smoothstep
-                        val scale = 1.0 + maxZoom * ease
-                        val frame = produceZoomFrame(base, scale, width, height)
+                        val motion = handheldMotion(frameIndex, totalFrames, width, height)
+                        val frame = produceMotionFrame(base, motion, width, height)
                         val nv12 = bitmapToNV12(frame)
                         frame.recycle()
                         val inBuf = encoder.getInputBuffer(inIdx)!!
@@ -181,12 +195,50 @@ class MediaEngine(private val context: Context) {
         if (base != src) base.recycle()
     }
 
-    /** 按 scale 以中心为锚点放大并从中心裁剪回原尺寸（对应 Python generate_zoom_frame） */
-    private fun produceZoomFrame(src: Bitmap, scale: Double, w: Int, h: Int): Bitmap {
+    /** 单帧的手持变换参数 */
+    private class MotionFrame(val scale: Float, val dx: Float, val dy: Float, val rotDeg: Float)
+
+    /**
+     * 计算第 index 帧的手持变换。
+     * 位移/旋转都用 sin(πt) 包络 → 首末帧回到原始取景；
+     * 组内是两组"不可通约"频率的正弦叠加 → 自然、非匀速的有机漂移（避免机械感）。
+     * 裁切量按当帧位移实时计算，取"刚好不露黑边"的最小值。
+     */
+    private fun handheldMotion(index: Int, totalFrames: Int, w: Int, h: Int): MotionFrame {
+        val pi = 3.14159265f
+        val tau = 6.2831855f
+        val t = index.toFloat() / (totalFrames - 1).toFloat()
+        val env = sin(pi * t)                                   // 0 → 1 → 0
+
+        // 真实手持的大致量级：横向 1.5% 画宽、纵向 1.2% 画高、旋转 < 0.2°
+        val ampX = 0.015f * w
+        val ampY = 0.012f * h
+        val ampRotDeg = 0.18f
+
+        val dx = ampX * env * (0.62f * sin(tau * 0.70f * t + 0.40f) +
+                               0.38f * sin(tau * 1.90f * t + 2.10f))
+        val dy = ampY * env * (0.65f * sin(tau * 0.55f * t + 1.70f) +
+                               0.35f * sin(tau * 1.60f * t + 4.20f))
+        val rotDeg = ampRotDeg * env * (0.60f * sin(tau * 0.45f * t + 0.90f) +
+                                        0.40f * sin(tau * 1.20f * t + 3.30f))
+
+        // 旋转会让四角额外位移约 r·θ，把它并入安全边距
+        val rotPx = 0.5f * hypot(w.toFloat(), h.toFloat()) * (abs(rotDeg) * pi / 180f)
+        val needX = 2f * (abs(dx) + rotPx) / w
+        val needY = 2f * (abs(dy) + rotPx) / h
+        val scale = 1f + max(needX, needY) + 0.004f             // 0.4% 兜底，防采样边缘露底
+
+        return MotionFrame(scale, dx, dy, rotDeg)
+    }
+
+    /** 绘制一帧：绕画幅中心缩放 → 绕中心旋转 → 平移（post 链顺序即变换施加顺序） */
+    private fun produceMotionFrame(src: Bitmap, m: MotionFrame, w: Int, h: Int): Bitmap {
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         val matrix = Matrix()
-        matrix.setScale(scale.toFloat(), scale.toFloat(), w / 2f, h / 2f)
+        matrix.setScale(m.scale, m.scale, w / 2f, h / 2f)
+        matrix.postRotate(m.rotDeg, w / 2f, h / 2f)
+        matrix.postTranslate(m.dx, m.dy)
         canvas.drawBitmap(src, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
         return out
     }
