@@ -293,7 +293,8 @@ class MediaEngine(private val context: Context) {
         // 千分之几的微小位移，这里显式归零，保证封面与原始图片严格一致。
         if (index == 0 || index == totalFrames - 1) return MotionFrame(0f, 0f, 0f)
         val t = index.toFloat() / (totalFrames - 1).toFloat()
-        val env = pow(sin(PI * t), ENV_POWER)                   // 0 → 1 → 0，中段更饱满
+        // 注意必须是接收者写法 x.pow(y)：kotlin.math.pow 是扩展函数，没有 pow(a, b) 这种顶层形式
+        val env = sin(PI * t).pow(ENV_POWER)                     // 0 → 1 → 0，中段更饱满
 
         val p1 = phases[0]
         val p2 = phases[1]
